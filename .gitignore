@@ -1,0 +1,22 @@
+# Publish source only. User data and old local builds are never tracked.
+*
+!/.gitignore
+!/app.py
+!/cloudflare_client.py
+!/naver_browser.py
+!/naver_tools.py
+!/secret_store.py
+!/site_builder.py
+!/updater.py
+!/version.py
+!/requirements.txt
+!/requirements-build.txt
+!/README.md
+!/SiteFlow.spec
+!/tests/
+!/tests/test_*.py
+!/scripts/
+!/scripts/build_release.py
+!/.github/
+!/.github/workflows/
+!/.github/workflows/release.yml

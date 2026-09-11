@@ -1,0 +1,37 @@
+name: Build and release Windows app
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m playwright install chromium
+      - run: python -m unittest discover -s tests -v
+      - run: python scripts/build_release.py
+      - name: Upload complete release before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = python -c "from version import APP_VERSION; print(APP_VERSION)"
+          $tag = "v$version"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Release already exists; increment version.py and push a new tag" }
+          gh release create $tag --draft --title "Site Flow $tag" --generate-notes --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Release creation failed" }
+          gh release upload $tag "release/$tag/SiteFlow-Windows-x64.zip" "release/$tag/SHA256SUMS.txt"
+          if ($LASTEXITCODE -ne 0) { throw "Release upload failed" }
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed" }
