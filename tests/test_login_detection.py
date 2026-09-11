@@ -12,13 +12,17 @@ class LoginDetectionTests(unittest.TestCase):
         helper = NaverBrowser(Path(tempfile.gettempdir()))
         helper.page = Mock()
         helper.page.is_closed.return_value = False
+        helper.page.url = 'https://searchadvisor.naver.com/console/board'
         helper.context = Mock()
+        helper.context.pages = [helper.page]
+        helper.context.cookies.return_value = []
         helper._visible = Mock(return_value=None)
         return helper
 
     def test_login_without_registration_input(self):
         helper = self.helper()
         response = Mock(url='https://searchadvisor.naver.com/api-board/list/test')
+        response.frame.page = helper.page
         response.json.return_value = {'code': 0, 'items': [], 'meta': {'max': 100}}
         helper._goto_tolerating_login_redirect = lambda _: helper._capture_board_response(response)
         self.assertEqual(helper.count_registered_sites(), (0, 100))
@@ -35,6 +39,7 @@ class LoginDetectionTests(unittest.TestCase):
     def test_failed_response_is_not_login_success(self):
         helper = self.helper()
         response = Mock(url='https://searchadvisor.naver.com/api-board/list/test')
+        response.frame.page = helper.page
         response.json.return_value = {'code': 401, 'items': []}
         helper._capture_board_response(response)
         self.assertIsNone(helper.board_payload)

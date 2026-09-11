@@ -589,11 +589,8 @@ class PublisherApp(tk.Tk):
                     self.naver_browser.browser_process is not None
                     and self.naver_browser.browser_process.poll() is None
                 )
-                if (
-                    process_alive
-                    and self.naver_browser.page
-                    and not self.naver_browser.page.is_closed()
-                ):
+                if process_alive and self.naver_browser.browser.is_connected():
+                    self.naver_browser.select_live_page()
                     return self.naver_browser
             except Exception:
                 pass

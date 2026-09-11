@@ -236,34 +236,92 @@ class NaverBrowser:
         if "/api-board/list/" not in response.url:
             return
         try:
+            if response.frame.page != self.page:
+                return
             payload = response.json()
             if payload.get("code") == 0 and isinstance(payload.get("items"), list):
                 self.board_payload = payload
         except (PlaywrightError, ValueError, AttributeError):
             pass
 
+    @staticmethod
+    def _is_login_page(page: Page) -> bool:
+        return urlsplit(page.url).hostname == "nid.naver.com"
+
+    def select_live_page(self) -> Page:
+        pages = [page for page in self.context.pages if not page.is_closed()]
+        login_pages = [page for page in pages if self._is_login_page(page)]
+        naver_pages = [page for page in pages if (
+            urlsplit(page.url).hostname == "naver.com"
+            or (urlsplit(page.url).hostname or "").endswith(".naver.com")
+        )]
+        if login_pages:
+            selected = login_pages[-1]
+        elif self.page in naver_pages:
+            selected = self.page
+        elif naver_pages:
+            selected = naver_pages[-1]
+        elif self.page in pages:
+            selected = self.page
+        elif pages:
+            selected = pages[-1]
+        else:
+            selected = self.context.new_page()
+        if selected != self.page:
+            self.board_payload = None
+        self.page = selected
+        return selected
+
+    def _login_session(self) -> tuple:
+        # Compare session changes in memory only; never log authentication cookies.
+        return tuple(sorted(
+            (cookie["name"], cookie["value"])
+            for cookie in self.context.cookies("https://naver.com")
+            if cookie["name"] in {"NID_AUT", "NID_SES"}
+        ))
+
     def _wait_dashboard(self, timeout_seconds: int = 600, require_input: bool = True):
-        assert self.page
+        self.select_live_page()
         self.board_payload = None
-        self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
+        session = self._login_session()
+        waiting_login = self._is_login_page(self.page)
+        if not waiting_login:
+            self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
         deadline = time.monotonic() + timeout_seconds
         login_notified = False
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise NaverAutomationError("네이버 로그인 대기를 중지했습니다.")
-            if self.page.is_closed():
-                raise NaverAutomationError("네이버 창이 닫혔습니다. 로그인 창을 다시 열어 주세요.")
-            if not require_input and self.board_payload is not None:
+            if not any(not page.is_closed() for page in self.context.pages):
+                raise NaverAutomationError("네이버 창이 모두 닫혔습니다. 로그인 창을 다시 열어 주세요.")
+            previous_page = self.page
+            self.select_live_page()
+            current_session = self._login_session()
+            session_changed = current_session != session
+            session = current_session
+            on_login = self._is_login_page(self.page)
+            if session_changed:
+                self.board_payload = None
+            if not on_login and (waiting_login or previous_page != self.page or session_changed):
+                self.board_payload = None
+                self.status("새 네이버 로그인 상태로 서치어드바이저를 확인합니다.")
+                self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
+            waiting_login = self._is_login_page(self.page)
+            if not waiting_login and not require_input and self.board_payload is not None:
                 self.context.storage_state(path=str(self.state_file))
                 return None
-            field = self._visible(self.page.locator('input[maxlength="253"][type="text"]'))
-            if field:
+            field = None if waiting_login else self._visible(self.page.locator('input[maxlength="253"][type="text"]'))
+            if require_input and field:
                 self.context.storage_state(path=str(self.state_file))
                 return field
             if not login_notified:
                 self.status("네이버 로그인이 필요하면 열린 Chromium에서 로그인해 주세요. 최대 10분간 기다립니다.")
                 login_notified = True
-            self.page.wait_for_timeout(500)
+            try:
+                self.page.wait_for_timeout(500)
+            except PlaywrightError:
+                if not self.page.is_closed():
+                    raise
         raise NaverAutomationError("네이버 로그인 또는 웹마스터 도구 화면 대기 시간이 초과되었습니다.")
 
     def register_and_download(self, site_url: str, download_dir: Path) -> Path:

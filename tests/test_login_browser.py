@@ -1,0 +1,81 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+from naver_browser import NAVER_DASHBOARD, NaverBrowser
+
+
+class LoginBrowserTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.playwright = sync_playwright().start()
+        self.addCleanup(self.playwright.stop)
+        self.browser = self.playwright.chromium.launch(headless=True)
+        self.addCleanup(self.browser.close)
+        self.context = self.browser.new_context()
+        self.context.route('**/*', self.route)
+        self.helper = NaverBrowser(Path(self.directory.name))
+        self.helper.context = self.context
+        self.helper.page = self.context.new_page()
+        self.context.on('response', self.helper._capture_board_response)
+        self.login_visits = 0
+
+    def route(self, route):
+        url = route.request.url
+        if '/api-board/list/' in url:
+            account = 'second' if 'NID_AUT=second' in route.request.headers.get('cookie', '') else 'first'
+            route.fulfill(content_type='application/json', body=json.dumps({
+                'code': 0, 'items': [account], 'meta': {'max': 100},
+            }))
+        elif url == NAVER_DASHBOARD:
+            route.fulfill(content_type='text/html', body="""
+                <script>fetch('/api-board/list/current')</script>
+            """)
+        elif 'nid.naver.com' in url:
+            self.login_visits += 1
+            route.fulfill(content_type='text/html', body="""
+                <script>setTimeout(() => {
+                    document.cookie='NID_AUT=second; domain=.naver.com; path=/; Secure';
+                    location.href='https://www.naver.com/';
+                }, 600)</script>
+            """)
+        else:
+            route.fulfill(content_type='text/html', body='Naver home')
+
+    def test_login_home_redirect_and_session_saved(self):
+        self.helper.page.goto('https://nid.naver.com/login')
+        self.helper._wait_dashboard(timeout_seconds=5, require_input=False)
+        self.assertEqual(self.helper.board_payload['items'], ['second'])
+        self.assertEqual(self.login_visits, 1)
+        state = json.loads(self.helper.state_file.read_text())
+        self.assertTrue(any(c['name'] == 'NID_AUT' and c['value'] == 'second'
+                            for c in state['cookies']))
+
+    def test_new_login_tab_replaces_closed_original_without_closing_browser(self):
+        original = self.helper.page
+        login = self.context.new_page()
+        login.goto('https://nid.naver.com/login')
+        original.close()
+        self.helper._wait_dashboard(timeout_seconds=5, require_input=False)
+        self.assertEqual(self.helper.page, login)
+        self.assertTrue(self.browser.is_connected())
+        self.assertEqual(len(self.context.pages), 1)
+
+    def test_account_switch_ignores_previous_account_payload(self):
+        self.helper._wait_dashboard(timeout_seconds=5, require_input=False)
+        self.assertEqual(self.helper.board_payload['items'], ['first'])
+        login = self.context.new_page()
+        login.goto('https://nid.naver.com/login')
+        self.helper._wait_dashboard(timeout_seconds=5, require_input=False)
+        self.assertEqual(self.helper.page, login)
+        self.assertEqual(self.helper.board_payload['items'], ['second'])
+
+    def test_other_tab_response_is_ignored(self):
+        other = self.context.new_page()
+        other.goto(NAVER_DASHBOARD)
+        other.wait_for_timeout(200)
+        self.assertIsNone(self.helper.board_payload)
