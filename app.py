@@ -61,6 +61,7 @@ class Project:
     robots: str = "대기"
     sitemap: str = "대기"
     crawl: str = "대기"
+    crawl_completed_at: str = ""
     updated_at: str = ""
     last_error: str = ""
 
@@ -186,7 +187,10 @@ class PublisherApp(tk.Tk):
         table_panel.pack(fill="both", expand=True)
         columns = ("name", "url", "pages", "registration", "cloudflare", "cloudflare_account", "ownership", "naver_account", "frequency", "robots", "sitemap", "crawl")
         columns = ("name", "title") + columns[1:]
-        self.tree = ttk.Treeview(table_panel, columns=columns, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(table_panel, columns=columns, show="tree headings", selectmode="extended")
+        self.tree.heading('#0', text='완료일별 그룹')
+        self.tree.column('#0', width=245, minwidth=160, stretch=False)
+        self.tree.tag_configure('completed_group', background='#E8EFF9', foreground='#17375E')
         headings = {"name": "ZIP/프로젝트", "url": "인식한 사이트 주소", "pages": "페이지", "registration": "네이버 등록", "cloudflare": "배포", "cloudflare_account": "CF 계정", "ownership": "소유확인", "naver_account": "네이버 아이디", "frequency": "수집 주기", "robots": "ROBOTS", "sitemap": "사이트맵", "crawl": "페이지 요청"}
         widths = {"name": 125, "url": 190, "pages": 45, "registration": 78, "cloudflare": 72, "cloudflare_account": 82, "ownership": 72, "naver_account": 110, "frequency": 82, "robots": 68, "sitemap": 68, "crawl": 82}
         for column in columns:
@@ -204,7 +208,7 @@ class PublisherApp(tk.Tk):
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
-        self.tree.bind("<Double-1>", lambda _event: self.open_selected_site())
+        self.tree.bind("<Double-1>", self._table_double_click)
         self.tree.bind("<Control-c>", self.copy_selected_urls)
         self.tree.bind("<Delete>", lambda _event: self.delete_selected_projects())
 
@@ -364,22 +368,55 @@ class PublisherApp(tk.Tk):
             return None
         return selected[0]
 
+    def _table_double_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if row and not row.startswith('completed:'):
+            self.open_selected_site()
+
     def _refresh_table(self) -> None:
         selected = self.tree.selection() if hasattr(self, "tree") else ()
+        position = self.tree.yview()
+        if not hasattr(self, '_group_open'):
+            self._group_open = {}
+        if not getattr(self, '_table_query', ''):
+            for row in self.tree.get_children():
+                if row.startswith('completed:'):
+                    self._group_open[row] = bool(self.tree.item(row, 'open'))
         for row in self.tree.get_children():
             self.tree.delete(row)
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
+        groups = {}
         for project in self.projects:
             if query and all(
                 query not in value.lower()
                 for value in (project.name, project.url, project.naver_account, project.title)
             ):
                 continue
-            self.tree.insert("", "end", iid=project.name, values=(project.name, project.title or "제목 없음", project.url, project.pages, project.registration, project.cloudflare, project.cloudflare_account, project.ownership, project.naver_account, project.frequency, project.robots, project.sitemap, project.crawl))
+            parent = ''
+            if project.crawl.startswith('완료'):
+                day = project.crawl_completed_at[:10]
+                parent = 'completed:' + (day or 'unknown')
+                if parent not in groups:
+                    groups[parent] = (day, [])
+                groups[parent][1].append(project)
+                continue
+            self._insert_project_row(project, parent)
+        for parent, (day, projects) in sorted(groups.items(), key=lambda item: item[1][0], reverse=True):
+            label = day + ' 페이지 요청 완료' if day else '이전 완료 · 날짜 미기록'
+            self.tree.insert('', 'end', iid=parent, text=f'{label} ({len(projects)}개)',
+                             open=bool(query) or self._group_open.get(parent, False), tags=('completed_group',))
+            for project in projects:
+                self._insert_project_row(project, parent)
         for item in selected:
             if self.tree.exists(item):
                 self.tree.selection_add(item)
+        if query == getattr(self, '_table_query', '') and position:
+            self.tree.yview_moveto(position[0])
+        self._table_query = query
         self._update_summary()
+
+    def _insert_project_row(self, project, parent):
+        self.tree.insert(parent, 'end', iid=project.name, values=(project.name, project.title or '제목 없음', project.url, project.pages, project.registration, project.cloudflare, project.cloudflare_account, project.ownership, project.naver_account, project.frequency, project.robots, project.sitemap, project.crawl))
 
     def _update_summary(self) -> None:
         if not hasattr(self, "card_values"):
@@ -1198,6 +1235,11 @@ class PublisherApp(tk.Tk):
                                 "sitemap": "사이트맵",
                                 "crawl": "페이지 요청",
                             }
+                            if field_name == 'crawl':
+                                if state.startswith('완료') and not project.crawl_completed_at:
+                                    project.crawl_completed_at = time.strftime('%Y-%m-%d %H:%M:%S')
+                                elif not state.startswith('완료'):
+                                    project.crawl_completed_at = ''
                             setattr(project, field_name, state)
                             self._checkpoint(
                                 project, f"{project.name} {labels[field_name]}: {state}"
