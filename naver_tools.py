@@ -61,6 +61,8 @@ def verify_public_deployment(
         "sitemap.xml": site_root / "sitemap.xml",
         f"{data['indexnow_key']}.txt": site_root / f"{data['indexnow_key']}.txt",
     }
+    for route, relative in data.get('page_files', {}).items():
+        expected[route.lstrip('/')] = site_root / relative
     missing = [name for name, path in expected.items() if not path.is_file()]
     if missing:
         raise NaverToolError(f"배포 작업본에 필수 파일이 없습니다: {', '.join(missing)}")
@@ -90,6 +92,17 @@ def verify_public_deployment(
             except requests.RequestException as exc:
                 all_match = False
                 last_results[name] = f"접속 실패: {exc}"
+        if data.get('seo_checked'):
+            try:
+                response = requests.get(f"{base_url}/__siteflow_missing_{nonce}", timeout=20, allow_redirects=False)
+                if response.status_code != 404:
+                    all_match = False
+                    last_results['404'] = f'오류: HTTP {response.status_code}'
+                else:
+                    last_results['404'] = '일치'
+            except requests.RequestException as exc:
+                all_match = False
+                last_results['404'] = str(exc)
         if all_match:
             return last_results
         if time.monotonic() >= deadline:

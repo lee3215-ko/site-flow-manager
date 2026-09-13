@@ -8,6 +8,32 @@ from naver_tools import NaverToolError, verify_public_deployment
 
 
 class PublicVerificationTests(unittest.TestCase):
+    def test_seo_verification_checks_html_and_real_404(self):
+        with tempfile.TemporaryDirectory() as temp:
+            site, verification = self._site(Path(temp))
+            (site / 'index.html').write_bytes(b'<html>new canonical</html>')
+            manifest = site.parent / 'publish-manifest.json'
+            data = json.loads(manifest.read_text())
+            data.update(seo_checked=True, page_files={'/': 'index.html'})
+            manifest.write_text(json.dumps(data))
+
+            def response(url, **kwargs):
+                from urllib.parse import urlsplit
+                path = urlsplit(url).path.lstrip('/')
+                if path.startswith('__siteflow_missing_'):
+                    return Mock(status_code=404)
+                return Mock(status_code=200, content=(site / (path or 'index.html')).read_bytes())
+
+            with patch('naver_tools.requests.get', side_effect=response):
+                self.assertEqual(verify_public_deployment(site, verification, timeout_seconds=0)['404'], '일치')
+            def fallback(url, **kwargs):
+                if '__siteflow_missing_' in url:
+                    return Mock(status_code=200)
+                return response(url, **kwargs)
+            with patch('naver_tools.requests.get', side_effect=fallback):
+                with self.assertRaises(NaverToolError):
+                    verify_public_deployment(site, verification, timeout_seconds=0)
+
     def _site(self, root: Path) -> tuple[Path, Path]:
         site = root / "site"
         site.mkdir()

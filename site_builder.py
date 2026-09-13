@@ -11,6 +11,7 @@ from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
+from seo_prepare import normalize_site, verification_page, public_path
 
 
 MAX_FILES = 20_000
@@ -122,7 +123,7 @@ def page_path(root: Path, html_path: Path) -> str:
         return "/"
     if lowered.endswith("/index.html"):
         return "/" + quote(relative[:-10].rstrip("/")) + "/"
-    return "/" + quote(relative)
+    return public_path(relative)
 
 
 def discover_pages(root: Path) -> list[str]:
@@ -134,24 +135,31 @@ def discover_pages(root: Path) -> list[str]:
             continue
         if path.name.lower() in {"404.html", "500.html"}:
             continue
+        if verification_page(path):
+            continue
         pages.append(page_path(root, path))
     return sorted(set(pages), key=lambda value: (value != "/", value))
 
 
 def write_seo_files(root: Path, base_url: str, indexnow_key: str | None = None) -> PreparedSite:
     base_url = base_url.rstrip("/")
-    pages = discover_pages(root)
+    try:
+        page_files = normalize_site(root, base_url)
+    except (ValueError, UnicodeError) as exc:
+        raise SiteBuildError(str(exc)) from exc
+    pages = sorted(page_files)
     if not pages:
         raise SiteBuildError("사이트에서 HTML 페이지를 찾지 못했습니다.")
 
     key = indexnow_key or secrets.token_hex(16)
     sitemap_url = f"{base_url}/sitemap.xml"
-    robots = "\n".join(("User-agent: *", "Allow: /", f"Sitemap: {sitemap_url}", ""))
+    old_robots = (root / "robots.txt").read_text(encoding="utf-8-sig") if (root / "robots.txt").exists() else "User-agent: *\nAllow: /\n"
+    robots = '\n'.join(line for line in old_robots.splitlines() if not line.strip().lower().startswith('sitemap:')) + f'\nSitemap: {sitemap_url}\n'
     (root / "robots.txt").write_text(robots, encoding="utf-8")
 
     today = date.today().isoformat()
     entries = "\n".join(
-        f"  <url><loc>{base_url}{path}</loc><lastmod>{today}</lastmod></url>" for path in pages
+        f"  <url><loc>{base_url}{path}</loc></url>" for path in pages
     )
     sitemap = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -166,6 +174,8 @@ def write_seo_files(root: Path, base_url: str, indexnow_key: str | None = None) 
         "base_url": base_url,
         "pages": [f"{base_url}{path}" for path in pages],
         "indexnow_key": key,
+        "page_files": page_files,
+        "seo_checked": True,
     }
     (root.parent / "publish-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -187,6 +197,7 @@ def prepare_zip(
 ) -> PreparedSite:
     unpacked = project_dir / "unpacked"
     publish_root = project_dir / "site"
+    preserved = {p.name: p.read_bytes() for p in publish_root.glob('*.html') if verification_page(p)}
     if unpacked.exists():
         shutil.rmtree(unpacked)
     if publish_root.exists():
@@ -195,6 +206,8 @@ def prepare_zip(
     safe_extract(zip_path, unpacked)
     source_root = locate_site_root(unpacked)
     shutil.copytree(source_root, publish_root)
+    for name, content in preserved.items():
+        (publish_root / name).write_bytes(content)
     return write_seo_files(
         publish_root, base_url or f"https://{project_name}.pages.dev"
     )

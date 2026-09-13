@@ -115,6 +115,7 @@ class PublisherApp(tk.Tk):
         tk.Label(nav, text="다중 사이트 자동 등록", bg=self.COLORS["nav"], fg="#9FB3CC", font=("Malgun Gothic", 9)).pack(anchor="w", padx=24, pady=(0, 28))
         self._nav_button(nav, "대시보드", self._refresh_table, active=True)
         self._nav_button(nav, "ZIP 여러 개 추가", self.add_zips)
+        self._nav_button(nav, "선택 사이트 SEO 재배포", self.redeploy_seo)
         self._nav_button(nav, "Cloudflare 설정", self.open_settings)
         self._nav_button(nav, "네이버 로그인 저장", self.open_naver_login)
         self._nav_button(nav, "연결 현황 새로고침", self.refresh_service_counts)
@@ -485,6 +486,10 @@ class PublisherApp(tk.Tk):
         )
 
     def check_updates(self, manual=True) -> None:
+        if os.environ.get("SITEFLOW_DEV") == "1":
+            if manual:
+                messagebox.showinfo(APP_TITLE, "개발자 모드: 소스 변경 시 자동 빌드됩니다. 바탕화면 바로가기로 다시 실행하면 최신 빌드를 사용합니다.")
+            return
         if self.closing or self.update_check_running:
             return
         self.update_check_running = True
@@ -909,13 +914,30 @@ class PublisherApp(tk.Tk):
             messagebox.showinfo(APP_TITLE, message)
         self._background("여러 ZIP 파일을 검사하고 사이트 주소로 인식하는 중...", prepare_all, done)
 
-    def run_registration_batch(self) -> None:
+    def redeploy_seo(self) -> None:
+        if self.busy:
+            messagebox.showinfo(APP_TITLE, "현재 작업이 끝난 후 진행해 주세요.")
+            return
+        selected = self._selected_many(default_all=False)
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "재배포할 사이트를 목록에서 선택해 주세요.")
+            return
+        if not messagebox.askokcancel(APP_TITLE, "선택 사이트의 작업용 파일을 보정하고 재배포합니다. ZIP 원본과 기존 네이버 소유확인 파일은 보존합니다. 진행할까요?"):
+            return
+        for project in selected:
+            project.cloudflare = "재배포 필요"
+            project.deployment_verified = "대기"
+        self._save()
+        self._refresh_table()
+        self.run_registration_batch(selected)
+
+    def run_registration_batch(self, selected_projects=None) -> None:
         try:
             delay_min, delay_max = self._delay_range()
         except ValueError as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
-        selected = self._selected_many(default_all=True)
+        selected = selected_projects if selected_projects is not None else self._selected_many(default_all=True)
         candidates = [
             project
             for project in selected
@@ -1025,7 +1047,16 @@ class PublisherApp(tk.Tk):
                                 project,
                                 f"Cloudflare 배포 시작: {project.name} → {project.cloudflare_account}{usage}",
                             )
-                            deployment_url, _ = client.deploy(project.name, Path(project.site_root))
+                            self._checkpoint(project, '배포 전 주소 보정 및 SEO 검사 중...')
+                            from site_builder import write_seo_files
+                            root = Path(project.site_root)
+                            previous_manifest = load_manifest(root)
+                            prepared = write_seo_files(root, actual_url, previous_manifest.get('indexnow_key'))
+                            project.pages = prepared.page_count
+                            if verification_path.resolve() != (root / verification_path.name).resolve():
+                                install_verification_file(root, verification_path)
+                            self._checkpoint(project, f'SEO 사전 검사 완료: 콘텐츠 {project.pages}개 / 소유확인 파일 보존')
+                            deployment_url, _ = client.deploy(project.name, root)
                             pool.record_project(account.get("account_id", ""), project.name)
                             self.cloudflare_statuses = pool.statuses()
                             self.after(0, self._update_service_labels)
@@ -1040,7 +1071,8 @@ class PublisherApp(tk.Tk):
                             )
                             project.cloudflare = "완료"
                             project.deployment_verified = "완료"
-                            project.ownership = "캡차 대기"
+                            if project.ownership != "완료":
+                                project.ownership = "캡차 대기"
                             self._checkpoint(project, f"배포 및 공개 파일 확인 완료: {project.url}")
 
                         archived = move_zip_to_success(Path(project.zip_path))

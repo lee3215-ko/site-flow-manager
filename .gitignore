@@ -7,6 +7,7 @@
 !/naver_tools.py
 !/secret_store.py
 !/site_builder.py
+!/seo_prepare.py
 !/updater.py
 !/version.py
 !/requirements.txt
@@ -17,6 +18,9 @@
 !/tests/test_*.py
 !/scripts/
 !/scripts/build_release.py
+!/scripts/dev_build.py
+!/scripts/install_dev.ps1
+!/AGENTS.md
 !/.github/
 !/.github/workflows/
 !/.github/workflows/release.yml
