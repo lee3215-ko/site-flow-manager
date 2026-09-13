@@ -31,6 +31,7 @@ class Tags(HTMLParser):
 
 
 def normalize_site(root: Path, base: str):
+    root = root.resolve()
     base = base.rstrip('/')
     parts = urlsplit(base)
     if parts.scheme != 'https' or not parts.netloc or parts.path or parts.query or parts.fragment or parts.username:
