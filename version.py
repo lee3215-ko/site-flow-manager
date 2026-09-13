@@ -1,3 +1,3 @@
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.2.1"
 GITHUB_REPOSITORY = "lee3215-ko/site-flow-manager"
 ASSET_NAME = "SiteFlow-Windows-x64.zip"

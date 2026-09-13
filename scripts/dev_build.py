@@ -80,6 +80,8 @@ def build():
         with sync_playwright() as playwright:
             browser = Path(playwright.chromium.executable_path).parent
         shutil.copytree(browser, output / 'browser', ignore=shutil.ignore_patterns('debug.log', 'First Run'))
+        from deployment_runtime import bundle_runtime
+        bundle_runtime(output)
         if fingerprint() != signature:
             raise RuntimeError('Source changed during build; waiting for a stable revision')
         exe = output / 'SiteFlow.exe'

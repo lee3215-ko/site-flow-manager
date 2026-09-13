@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import requests
+from deployment_runtime import preflight
 
 
 API_BASE = "https://api.cloudflare.com/client/v4"
@@ -119,15 +120,14 @@ class CloudflareClient:
         return f"https://{subdomain}"
 
     def deploy(self, project_name: str, site_root: Path) -> tuple[str, str]:
+        runtime = preflight()
         self.ensure_project(project_name)
-        npx = shutil.which("npx.cmd") or shutil.which("npx")
-        if not npx:
-            raise CloudflareError("Node.js의 npx를 찾지 못했습니다. Node.js LTS를 설치해 주세요.")
         env = os.environ.copy()
+        env['PATH'] = str(Path(runtime[0]).parent) + os.pathsep + env.get('PATH', '')
         env["CLOUDFLARE_API_TOKEN"] = self.api_token
         env["CLOUDFLARE_ACCOUNT_ID"] = self.account_id
         command = [
-            npx,
+            *runtime,
             "--yes",
             "wrangler@4",
             "pages",
@@ -148,6 +148,7 @@ class CloudflareClient:
             encoding="utf-8",
             errors="replace",
             timeout=600,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
         )
         output = "\n".join(part for part in (process.stdout, process.stderr) if part).strip()
         if process.returncode != 0:

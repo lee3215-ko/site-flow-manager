@@ -12,6 +12,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from version import APP_VERSION, ASSET_NAME
+from deployment_runtime import bundle_runtime
 from playwright.sync_api import sync_playwright
 
 
@@ -33,6 +34,7 @@ def main():
         shutil.copy2(ROOT / "dist/SiteFlow.exe", package / "SiteFlow.exe")
         shutil.copy2(ROOT / "README.md", package / "README.md")
         shutil.copytree(browser, package / "browser", ignore=shutil.ignore_patterns("debug.log", "First Run"))
+        bundle_runtime(package)
         (package / "version.json").write_text(json.dumps({"version": APP_VERSION}), encoding="utf-8")
         archive = output / ASSET_NAME
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:

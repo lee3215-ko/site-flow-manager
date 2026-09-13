@@ -990,6 +990,9 @@ class PublisherApp(tk.Tk):
             return
 
         def run():
+            from deployment_runtime import preflight
+            self._status('배포 도구 실행을 사전 확인하는 중...')
+            preflight()
             pool = CloudflareAccountPool(self._cloudflare_accounts())
             self.cloudflare_statuses = pool.refresh()
             pool.client_for(candidates[0].name)
