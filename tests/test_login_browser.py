@@ -79,3 +79,27 @@ class LoginBrowserTests(unittest.TestCase):
         other.goto(NAVER_DASHBOARD)
         other.wait_for_timeout(200)
         self.assertIsNone(self.helper.board_payload)
+
+    def test_callback_can_finish_without_being_interrupted(self):
+        self.context.route('**/auth/callback*', lambda route: route.fulfill(
+            content_type='text/html', body="""<script>setTimeout(() => {
+                document.cookie='callback_done=yes; path=/; Secure';
+                location.href='/console/board';
+            }, 1200)</script>"""))
+        self.helper.page.goto('https://searchadvisor.naver.com/auth/callback?code=test-only')
+        self.helper._wait_dashboard(timeout_seconds=5, require_input=False)
+        self.assertTrue(any(c['name'] == 'callback_done' for c in self.context.cookies()))
+
+    def test_site_auth_redirect_recovers_after_callback(self):
+        visits = []
+        def site_route(route):
+            visits.append(route.request.url)
+            if len(visits) == 1:
+                route.fulfill(content_type='text/html', body="<script>setTimeout(() => location.href='/auth/callback?code=test-only', 100)</script>")
+            else:
+                route.fulfill(content_type='text/html', body='<a href="/console/site/option?site=test">Settings</a>')
+        self.context.route('**/console/site/summary*', site_route)
+        self.context.route('**/auth/callback*', lambda route: route.fulfill(
+            content_type='text/html', body="<script>setTimeout(() => location.href='/console/board', 1800)</script>"))
+        self.helper._open_site('https://example.pages.dev')
+        self.assertEqual(len(visits), 2)

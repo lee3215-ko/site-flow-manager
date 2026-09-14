@@ -246,7 +246,10 @@ class NaverBrowser:
 
     @staticmethod
     def _is_login_page(page: Page) -> bool:
-        return urlsplit(page.url).hostname == "nid.naver.com"
+        url = urlsplit(page.url)
+        return url.hostname == "nid.naver.com" or (
+            url.hostname == "searchadvisor.naver.com" and url.path.startswith('/auth/')
+        )
 
     def select_live_page(self) -> Page:
         pages = [page for page in self.context.pages if not page.is_closed()]
@@ -289,6 +292,7 @@ class NaverBrowser:
             self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
         deadline = time.monotonic() + timeout_seconds
         login_notified = False
+        callback_started = None
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise NaverAutomationError("네이버 로그인 대기를 중지했습니다.")
@@ -300,6 +304,15 @@ class NaverBrowser:
             session_changed = current_session != session
             session = current_session
             on_login = self._is_login_page(self.page)
+            url = urlsplit(self.page.url)
+            if url.hostname == 'searchadvisor.naver.com' and url.path.startswith('/auth/'):
+                if callback_started is None:
+                    callback_started = time.monotonic()
+                    self.status('네이버 인증 완료를 기다립니다. 인증 중에는 페이지를 이동하지 않습니다.')
+                elif time.monotonic() - callback_started > 60:
+                    raise NaverAutomationError('네이버 인증 콜백이 60초 이상 완료되지 않았습니다. 열린 창에서 서치어드바이저 홈으로 이동해 다시 로그인해 주세요. 소유확인 실패로 판정한 것은 아닙니다.')
+            else:
+                callback_started = None
             if session_changed:
                 self.board_payload = None
             if not on_login and (waiting_login or previous_page != self.page or session_changed):
@@ -392,15 +405,30 @@ class NaverBrowser:
         self._goto_tolerating_login_redirect(
             self._site_console_url("summary", site_url)
         )
-        try:
-            self.page.locator('a[href^="/console/site/option?site="]').first.wait_for(
-                state="attached", timeout=60_000
-            )
-        except PlaywrightTimeoutError as exc:
-            raise NaverAutomationError(
-                f"{site_url}의 사이트 관리 화면을 열지 못했습니다. "
-                "네이버에서 소유확인이 완료됐는지 확인해 주세요."
-            ) from exc
+        deadline = time.monotonic() + 60
+        recovered = False
+        while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise NaverAutomationError('네이버 사이트 관리 화면 대기를 중지했습니다.')
+            self.select_live_page()
+            if self._is_login_page(self.page):
+                if recovered:
+                    raise NaverAutomationError('로그인 후에도 인증 화면으로 돌아갑니다. 현재 로그인 계정과 서치어드바이저 접근 상태를 확인해 주세요.')
+                self.status('사이트 관리 화면 진입 중 재인증이 필요합니다. 로그인 완료 후 다시 진입합니다.')
+                self._wait_dashboard(require_input=False)
+                self._goto_tolerating_login_redirect(self._site_console_url('summary', site_url))
+                recovered = True
+                deadline = time.monotonic() + 60
+                continue
+            if self._visible(self.page.locator('a[href^="/console/site/option?site="]')):
+                return
+            self.page.wait_for_timeout(250)
+        location = urlsplit(self.page.url)
+        raise NaverAutomationError(
+            f'{site_url}의 사이트 관리 화면을 열지 못했습니다. '
+            '현재 계정의 사이트 등록·소유확인 상태 또는 화면 변경을 확인해 주세요. '
+            f'현재 위치: {location.hostname}{location.path}'
+        )
 
     def _section(self, heading: str) -> Locator:
         assert self.page
