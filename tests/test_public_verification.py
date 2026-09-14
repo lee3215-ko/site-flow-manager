@@ -8,6 +8,18 @@ from naver_tools import NaverToolError, verify_public_deployment
 
 
 class PublicVerificationTests(unittest.TestCase):
+    def test_deploy_only_without_ownership_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            site, verification = self._site(Path(temp))
+            verification.unlink()
+            def response(url, **kwargs):
+                name = url.split('/')[-1].split('?')[0]
+                return Mock(status_code=200, content=(site / name).read_bytes())
+            with patch('naver_tools.requests.get', side_effect=response):
+                result = verify_public_deployment(site, None, timeout_seconds=0)
+            self.assertNotIn(verification.name, result)
+            self.assertIn('sitemap.xml', result)
+
     def test_seo_verification_checks_html_and_real_404(self):
         with tempfile.TemporaryDirectory() as temp:
             site, verification = self._site(Path(temp))

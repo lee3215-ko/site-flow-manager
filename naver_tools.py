@@ -48,19 +48,23 @@ def check_public_files(site_root: Path) -> dict[str, str]:
 
 def verify_public_deployment(
     site_root: Path,
-    verification_file: Path,
+    verification_file: Path | None,
     timeout_seconds: int = 120,
     interval_seconds: float = 3,
 ) -> dict[str, str]:
     data = load_manifest(site_root)
     base_url = data["base_url"].rstrip("/")
-    verification = site_root / verification_file.name
     expected = {
-        verification.name: verification,
         "robots.txt": site_root / "robots.txt",
         "sitemap.xml": site_root / "sitemap.xml",
         f"{data['indexnow_key']}.txt": site_root / f"{data['indexnow_key']}.txt",
     }
+    if verification_file is not None:
+        expected[verification_file.name] = site_root / verification_file.name
+    else:
+        # Preserve and verify any existing ownership files without logging in.
+        from seo_prepare import verification_page
+        expected.update({p.name: p for p in site_root.glob('*.html') if verification_page(p)})
     for route, relative in data.get('page_files', {}).items():
         expected[route.lstrip('/')] = site_root / relative
     missing = [name for name, path in expected.items() if not path.is_file()]

@@ -198,6 +198,9 @@ class PublisherApp(tk.Tk):
         self.date_filter.bind('<<ComboboxSelected>>', lambda event: self._refresh_table())
         self.visible_count = tk.Label(filters, bg=self.COLORS['bg'])
         self.visible_count.pack(side='left', padx=12)
+        self.deploy_only_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(filters, text='네이버 없이 배포만 (1단계)', variable=self.deploy_only_var,
+                       bg=self.COLORS['bg']).pack(side='right', padx=8)
         table_panel = tk.Frame(content, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"])
         table_panel.pack(fill="both", expand=True)
         columns = ("name", "url", "pages", "registration", "cloudflare", "cloudflare_account", "ownership", "naver_account", "frequency", "robots", "sitemap", "crawl")
@@ -988,6 +991,7 @@ class PublisherApp(tk.Tk):
         self.run_registration_batch(selected)
 
     def run_registration_batch(self, selected_projects=None) -> None:
+        deploy_only = self.deploy_only_var.get()
         try:
             delay_min, delay_max = self._delay_range()
         except ValueError as exc:
@@ -997,7 +1001,7 @@ class PublisherApp(tk.Tk):
         candidates = [
             project
             for project in selected
-            if project.registration != "완료"
+            if (not deploy_only and project.registration != "완료")
             or project.cloudflare != "완료"
             or project.deployment_verified != "완료"
             or archived_zip_path(Path(project.zip_path)) is None
@@ -1005,7 +1009,9 @@ class PublisherApp(tk.Tk):
         if not candidates:
             messagebox.showinfo(APP_TITLE, "등록하거나 배포할 ZIP이 없습니다.")
             return
-        if not messagebox.askokcancel(APP_TITLE, "자동화 전용 Chromium이 열립니다. 처음이면 네이버 로그인을 직접 완료해 주세요.\n\n사이트 등록과 HTML 다운로드는 자동이며, 소유확인 캡차는 모든 배포가 끝난 뒤 직접 진행합니다."):
+        confirmation = ("네이버 로그인 없이 HTML 주소·사이트맵·robots.txt를 보정하고 Cloudflare에 배포·검증합니다. 네이버 등록과 소유확인은 수행하지 않습니다."
+                        if deploy_only else "자동화 전용 Chromium이 열립니다. 처음이면 네이버 로그인을 직접 완료해 주세요.\n\n사이트 등록과 HTML 다운로드는 자동이며, 소유확인 캡차는 모든 배포가 끝난 뒤 직접 진행합니다.")
+        if not messagebox.askokcancel(APP_TITLE, confirmation):
             return
 
         def run():
@@ -1017,7 +1023,7 @@ class PublisherApp(tk.Tk):
             pool.client_for(candidates[0].name)
             self.after(0, self._update_service_labels)
             completed, errors = [], []
-            needs_naver = any(
+            needs_naver = not deploy_only and any(
                 project.registration != "완료"
                 or not Path(project.verification_file).is_file()
                 for project in candidates
@@ -1057,7 +1063,7 @@ class PublisherApp(tk.Tk):
                                 f"Cloudflare 실제 주소 보정: {old_url} → {actual_url}",
                             )
 
-                        if project.registration != "완료" or not Path(project.verification_file).is_file():
+                        if not deploy_only and (project.registration != "완료" or not Path(project.verification_file).is_file()):
                             if browser is None:
                                 browser = self._get_naver_browser()
                             project.registration = "진행 중"
@@ -1067,10 +1073,12 @@ class PublisherApp(tk.Tk):
                             install_verification_file(Path(project.site_root), verification)
                             project.verification_file = str(verification)
                             project.registration = "완료"
+                            project.cloudflare = "재배포 필요"
+                            project.deployment_verified = "대기"
                             project.ownership = "캡차 대기"
                             self._checkpoint(project, f"소유확인 HTML 삽입 완료: {verification.name}")
 
-                        verification_path = Path(project.verification_file)
+                        verification_path = None if deploy_only else Path(project.verification_file)
                         if project.cloudflare == "완료" and project.deployment_verified != "완료":
                             project.cloudflare = "공개 확인 중"
                             self._checkpoint(project, f"기존 배포 공개 파일 확인 중: {project.url}")
@@ -1111,7 +1119,7 @@ class PublisherApp(tk.Tk):
                             previous_manifest = load_manifest(root)
                             prepared = write_seo_files(root, actual_url, previous_manifest.get('indexnow_key'))
                             project.pages = prepared.page_count
-                            if verification_path.resolve() != (root / verification_path.name).resolve():
+                            if verification_path is not None and verification_path.resolve() != (root / verification_path.name).resolve():
                                 install_verification_file(root, verification_path)
                             self._checkpoint(project, f'SEO 사전 검사 완료: 콘텐츠 {project.pages}개 / 소유확인 파일 보존')
                             deployment_url, _ = client.deploy(project.name, root)
@@ -1122,14 +1130,14 @@ class PublisherApp(tk.Tk):
                             project.deployment_verified = "진행 중"
                             self._checkpoint(
                                 project,
-                                f"Cloudflare 명령 완료, 확인 HTML 공개 대기: {deployment_url}",
+                                f"Cloudflare 명령 완료, 공개 파일 검증 중: {deployment_url}",
                             )
                             verify_public_deployment(
                                 Path(project.site_root), verification_path
                             )
                             project.cloudflare = "완료"
                             project.deployment_verified = "완료"
-                            if project.ownership != "완료":
+                            if not deploy_only and project.ownership != "완료":
                                 project.ownership = "캡차 대기"
                             self._checkpoint(project, f"배포 및 공개 파일 확인 완료: {project.url}")
 
@@ -1157,15 +1165,15 @@ class PublisherApp(tk.Tk):
 
         def done(result):
             completed, errors, canceled = result
-            message = f"등록 파일 삽입 및 배포 완료: {len(completed)}개"
+            message = f"{'Cloudflare 배포만 완료' if deploy_only else '등록 파일 삽입 및 배포 완료'}: {len(completed)}개"
             if canceled:
                 message += "\n사용자 요청으로 중지했습니다."
             if errors:
                 message += f"\n실패: {len(errors)}개\n\n" + "\n".join(errors[:6])
-            else:
+            elif not deploy_only:
                 message += "\n\n이제 네이버에서 각 사이트의 캡차 소유확인을 직접 완료하세요."
             messagebox.showinfo(APP_TITLE, message)
-        self._background("네이버 등록 → 확인 HTML → Cloudflare 배포를 시작합니다.", run, done)
+        self._background("네이버 없이 SEO 보정 → Cloudflare 배포를 시작합니다." if deploy_only else "네이버 등록 → 확인 HTML → Cloudflare 배포를 시작합니다.", run, done)
 
     def mark_verified(self) -> None:
         if self.busy:
