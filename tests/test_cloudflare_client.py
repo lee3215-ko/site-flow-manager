@@ -1,10 +1,29 @@
 import unittest
 from unittest.mock import Mock
 
-from cloudflare_client import CloudflareAccountPool, CloudflareClient, CloudflareError
+from cloudflare_client import CloudflareAccountPool, CloudflareClient, CloudflareError, ProjectLimitError
 
 
 class CloudflareClientTests(unittest.TestCase):
+    def test_actual_limit_response_retries_same_project_on_next_account(self):
+        pool = CloudflareAccountPool([{'account_id': 'a'*32}, {'account_id': 'b'*32}])
+        pool.projects = [[], []]
+        pool.clients[0].project_url = Mock(side_effect=ProjectLimitError('full'))
+        pool.clients[1].project_url = Mock(return_value='https://same.pages.dev')
+        client, account, url = pool.project_for('same')
+        self.assertEqual(account['account_id'], 'b'*32)
+        pool.clients[1].project_url.assert_called_once_with('same')
+        self.assertIn(0, pool.full_accounts)
+
+    def test_other_api_error_does_not_rotate_accounts(self):
+        pool = CloudflareAccountPool([{'account_id': 'a'*32}, {'account_id': 'b'*32}])
+        pool.projects = [[], []]
+        pool.clients[0].project_url = Mock(side_effect=CloudflareError('rate limited'))
+        pool.clients[1].project_url = Mock()
+        with self.assertRaises(CloudflareError):
+            pool.project_for('same')
+        pool.clients[1].project_url.assert_not_called()
+
     @staticmethod
     def _response(payload, status_code=200):
         response = Mock()

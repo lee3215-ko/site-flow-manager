@@ -141,7 +141,13 @@ class PublisherApp(tk.Tk):
         self.naver_count_label = tk.Label(status_box, text="● 네이버 사이트 확인 전", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Malgun Gothic", 9, "bold"))
         self.naver_count_label.pack(anchor="e", pady=(3, 0))
 
-        content = tk.Frame(main, bg=self.COLORS["bg"])
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill='both', expand=True)
+        dashboard = tk.Frame(self.notebook, bg=self.COLORS['bg'])
+        log_tab = tk.Frame(self.notebook, bg=self.COLORS['panel'])
+        self.notebook.add(dashboard, text='사이트 목록')
+        self.notebook.add(log_tab, text='작업 기록 (로그)')
+        content = tk.Frame(dashboard, bg=self.COLORS["bg"])
         content.pack(fill="both", expand=True, padx=24, pady=18)
         cards = tk.Frame(content, bg=self.COLORS["bg"])
         cards.pack(fill="x")
@@ -183,11 +189,20 @@ class PublisherApp(tk.Tk):
         search.pack(side="right", ipady=7)
         tk.Label(toolbar, text="검색", bg=self.COLORS["bg"], fg=self.COLORS["muted"], font=("Malgun Gothic", 9)).pack(side="right", padx=8)
 
+        filters = tk.Frame(content, bg=self.COLORS['bg'])
+        filters.pack(fill='x', pady=(0, 8))
+        tk.Label(filters, text='목록 보기', bg=self.COLORS['bg']).pack(side='left', padx=6)
+        self.completion_filter = tk.StringVar(value='진행 / 미완료')
+        self.date_filter = ttk.Combobox(filters, textvariable=self.completion_filter, state='readonly', width=35)
+        self.date_filter.pack(side='left')
+        self.date_filter.bind('<<ComboboxSelected>>', lambda event: self._refresh_table())
+        self.visible_count = tk.Label(filters, bg=self.COLORS['bg'])
+        self.visible_count.pack(side='left', padx=12)
         table_panel = tk.Frame(content, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"])
         table_panel.pack(fill="both", expand=True)
         columns = ("name", "url", "pages", "registration", "cloudflare", "cloudflare_account", "ownership", "naver_account", "frequency", "robots", "sitemap", "crawl")
         columns = ("name", "title") + columns[1:]
-        self.tree = ttk.Treeview(table_panel, columns=columns, show="tree headings", selectmode="extended")
+        self.tree = ttk.Treeview(table_panel, columns=columns, show="headings", selectmode="extended")
         self.tree.heading('#0', text='완료일별 그룹')
         self.tree.column('#0', width=245, minwidth=160, stretch=False)
         self.tree.tag_configure('completed_group', background='#E8EFF9', foreground='#17375E')
@@ -212,11 +227,14 @@ class PublisherApp(tk.Tk):
         self.tree.bind("<Control-c>", self.copy_selected_urls)
         self.tree.bind("<Delete>", lambda _event: self.delete_selected_projects())
 
-        log_panel = tk.Frame(content, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"])
-        log_panel.pack(fill="x", pady=(10, 0))
+        log_panel = tk.Frame(log_tab, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"])
+        log_panel.pack(fill="both", expand=True, padx=12, pady=12)
         tk.Label(log_panel, text="작업 기록", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Malgun Gothic", 9, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
-        self.log = tk.Text(log_panel, height=4, bg="#F8FAFC", fg="#475467", relief="flat", font=("Consolas", 9), state="disabled", padx=8, pady=6)
-        self.log.pack(fill="x", padx=10, pady=(0, 9))
+        self.log = tk.Text(log_panel, wrap='word', bg="#F8FAFC", fg="#475467", relief="flat", font=("Consolas", 11), state="disabled", padx=8, pady=6)
+        log_scroll = ttk.Scrollbar(log_panel, orient='vertical', command=self.log.yview)
+        log_scroll.pack(side='right', fill='y')
+        self.log.configure(yscrollcommand=log_scroll.set)
+        self.log.pack(fill="both", expand=True, padx=10, pady=(0, 9))
 
         bottom = tk.Frame(content, bg=self.COLORS["bg"])
         bottom.pack(fill="x", pady=(10, 0))
@@ -359,7 +377,8 @@ class PublisherApp(tk.Tk):
         names = set(self.tree.selection())
         if names:
             return [project for project in self.projects if project.name in names]
-        return list(self.projects) if default_all else []
+        visible = set(self.tree.get_children())
+        return [project for project in self.projects if project.name in visible] if default_all else []
 
     def _selected_one(self) -> Project | None:
         selected = self._selected_many()
@@ -376,43 +395,43 @@ class PublisherApp(tk.Tk):
     def _refresh_table(self) -> None:
         selected = self.tree.selection() if hasattr(self, "tree") else ()
         position = self.tree.yview()
-        if not hasattr(self, '_group_open'):
-            self._group_open = {}
-        if not getattr(self, '_table_query', ''):
-            for row in self.tree.get_children():
-                if row.startswith('completed:'):
-                    self._group_open[row] = bool(self.tree.item(row, 'open'))
         for row in self.tree.get_children():
             self.tree.delete(row)
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
-        groups = {}
+        dates = sorted({p.crawl_completed_at[:10] for p in self.projects if p.crawl.startswith('완료') and p.crawl_completed_at}, reverse=True)
+        choices = ['진행 / 미완료', '전체', '완료 전체'] + dates
+        if any(p.crawl.startswith('완료') and not p.crawl_completed_at for p in self.projects):
+            choices.append('이전 완료 · 날짜 미기록')
+        self.date_filter.configure(values=choices)
+        mode = self.completion_filter.get()
+        if mode not in choices:
+            mode = '진행 / 미완료'
+            self.completion_filter.set(mode)
+        count = 0
         for project in self.projects:
+            completed = project.crawl.startswith('완료')
+            if mode == '진행 / 미완료' and completed:
+                continue
+            if mode == '완료 전체' and not completed:
+                continue
+            if mode not in {'진행 / 미완료', '전체', '완료 전체'}:
+                day = project.crawl_completed_at[:10] or '이전 완료 · 날짜 미기록'
+                if not completed or day != mode:
+                    continue
             if query and all(
                 query not in value.lower()
                 for value in (project.name, project.url, project.naver_account, project.title)
             ):
                 continue
-            parent = ''
-            if project.crawl.startswith('완료'):
-                day = project.crawl_completed_at[:10]
-                parent = 'completed:' + (day or 'unknown')
-                if parent not in groups:
-                    groups[parent] = (day, [])
-                groups[parent][1].append(project)
-                continue
-            self._insert_project_row(project, parent)
-        for parent, (day, projects) in sorted(groups.items(), key=lambda item: item[1][0], reverse=True):
-            label = day + ' 페이지 요청 완료' if day else '이전 완료 · 날짜 미기록'
-            self.tree.insert('', 'end', iid=parent, text=f'{label} ({len(projects)}개)',
-                             open=bool(query) or self._group_open.get(parent, False), tags=('completed_group',))
-            for project in projects:
-                self._insert_project_row(project, parent)
+            self._insert_project_row(project, '')
+            count += 1
+        self.visible_count.configure(text=f'{count}개 표시 / 전체 {len(self.projects)}개')
         for item in selected:
             if self.tree.exists(item):
                 self.tree.selection_add(item)
-        if query == getattr(self, '_table_query', '') and position:
+        if (mode, query) == getattr(self, '_table_query', None) and position:
             self.tree.yview_moveto(position[0])
-        self._table_query = query
+        self._table_query = (mode, query)
         self._update_summary()
 
     def _insert_project_row(self, project, parent):
@@ -1009,8 +1028,7 @@ class PublisherApp(tk.Tk):
                     if self.cancel_event.is_set():
                         break
                     try:
-                        client, account = pool.client_for(project.name)
-                        actual_url = client.project_url(project.name)
+                        client, account, actual_url = pool.project_for(project.name, self._status)
                         pool.record_project(
                             account.get("account_id", ""), project.name
                         )

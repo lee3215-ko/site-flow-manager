@@ -16,6 +16,9 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 class CloudflareError(RuntimeError):
     pass
 
+class ProjectLimitError(CloudflareError):
+    pass
+
 
 class CloudflareClient:
     def __init__(self, account_id: str, api_token: str) -> None:
@@ -42,7 +45,7 @@ class CloudflareClient:
             codes = {str(item.get("code", "")) for item in errors}
             lowered = detail.lower()
             if "limit of projects" in lowered:
-                raise CloudflareError(
+                raise ProjectLimitError(
                     "Cloudflare Pages 프로젝트 한도 100개에 도달했습니다. 기존 Pages 프로젝트를 삭제하거나 "
                     "다른 Cloudflare 계정의 Account ID와 API Token을 사용해야 합니다. 100개를 초과해 "
                     "운영하려면 Workers Static Assets 또는 Workers for Platforms 구성이 필요합니다."
@@ -169,6 +172,7 @@ class CloudflareAccountPool:
         self.projects: list[list[dict] | None] = [None] * len(self.accounts)
         self.errors: list[str] = [""] * len(self.accounts)
         self.current_index = 0
+        self.full_accounts = set()
 
     def refresh(self) -> list[dict]:
         statuses = []
@@ -246,7 +250,7 @@ class CloudflareAccountPool:
         for offset in range(len(self.accounts)):
             index = (self.current_index + offset) % len(self.accounts)
             projects = self.projects[index]
-            if projects is not None and len(projects) < self.project_limit:
+            if index not in self.full_accounts and projects is not None and len(projects) < self.project_limit:
                 self.current_index = index
                 return self.clients[index], self.accounts[index]
 
@@ -261,3 +265,21 @@ class CloudflareAccountPool:
             f"등록된 Cloudflare 계정 {len(self.accounts)}개의 Pages 프로젝트가 모두 "
             f"{self.project_limit}개 한도에 도달했습니다."
         )
+
+    def project_for(self, project_name, status=lambda message: None):
+        for _ in self.accounts:
+            client, account = self.client_for(project_name)
+            index = self.current_index
+            existing = any(p.get('name') == project_name for p in (self.projects[index] or []))
+            try:
+                url = client.project_url(project_name)
+                self.record_project(account.get('account_id', ''), project_name)
+                return client, account, url
+            except ProjectLimitError:
+                if existing:
+                    raise
+                self.full_accounts.add(index)
+                self.errors[index] = 'Cloudflare에서 프로젝트 한도 도달 응답'
+                self.current_index = (index + 1) % len(self.accounts)
+                status(f"{account.get('name', '계정')} 프로젝트 한도 도달: 다음 등록 계정으로 전환합니다.")
+        raise CloudflareError('등록된 계정에 새 프로젝트를 만들 공간이 없습니다.')
