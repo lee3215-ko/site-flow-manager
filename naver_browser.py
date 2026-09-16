@@ -11,7 +11,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 from playwright.sync_api import (
     Error as PlaywrightError,
@@ -239,9 +239,7 @@ class NaverBrowser:
         if current.hostname == target.hostname == 'searchadvisor.naver.com' and not self._is_login_page(self.page):
             if current.path == target.path and current.query == target.query:
                 return
-            relative = target.path + ('?' + target.query if target.query else '')
-            selector = f'a[href="{relative}"], a[href="{url}"]'
-            link = self._visible(self.page.locator(selector))
+            link = self._console_link(url)
             if not link:
                 group = '검증' if '/check/' in target.path else ('요청' if '/request/' in target.path else None)
                 if group:
@@ -249,7 +247,7 @@ class NaverBrowser:
                     if button and button.get_attribute('aria-expanded') != 'true':
                         button.click()
                         self.page.wait_for_timeout(300)
-                        link = self._visible(self.page.locator(selector))
+                        link = self._console_link(url)
             if link:
                 self.status(f'네이버 내부 링크로 이동: {target.path}')
                 link.click()
@@ -438,12 +436,59 @@ class NaverBrowser:
         return len(payload["items"]), int((payload.get("meta") or {}).get("max") or 100)
 
 
+    @staticmethod
+    def _site_key(url: str) -> tuple:
+        parsed = urlsplit(url)
+        return parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip('/'), parsed.query
+
+    def _console_link(self, target_url: str) -> Locator | None:
+        """Use rendered links; query escaping and a root trailing slash may differ."""
+        target = urlsplit(target_url)
+        expected = parse_qs(target.query)
+        try:
+            links = self.page.locator('a[href]')
+            hrefs = links.evaluate_all('(links) => links.map(a => a.href)')
+            for index, href in enumerate(hrefs):
+                actual = urlsplit(urljoin(self.page.url, href))
+                if (actual.scheme, actual.netloc, actual.path) != (target.scheme, target.netloc, target.path):
+                    continue
+                query = parse_qs(actual.query)
+                if 'site' in expected:
+                    if len(query.get('site', [])) != 1 or self._site_key(query['site'][0]) != self._site_key(expected['site'][0]):
+                        continue
+                elif query != expected:
+                    continue
+                link = links.nth(index)
+                if link.is_visible():
+                    return link
+        except PlaywrightError:
+            return None
+        return None
+
+    def _click_registered_site(self, site_url: str, timeout_seconds: float = 15) -> None:
+        target = self._site_console_url('summary', site_url)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise NaverSessionError('네이버 작업을 중지했습니다.')
+            if self.page.is_closed() or self._is_login_page(self.page):
+                raise NaverSessionError('사이트 목록 확인 중 인증 상태가 변경되었습니다. 열린 창을 확인해 주세요.')
+            link = self._console_link(target)
+            if link:
+                self.status(f'네이버 등록 목록의 사이트 링크 클릭: {site_url}')
+                link.click()
+                return
+            self.page.wait_for_timeout(250)
+        raise NaverAutomationError(
+            f'로그인은 확인했지만 현재 목록에서 {site_url}의 관리 링크를 찾지 못했습니다. '
+            '현재 계정에 등록된 주소(http/https 포함), 소유확인 상태와 목록의 검색·페이지를 확인해 주세요. '
+            '주소를 추측해 열거나 재로그인을 요청하지 않았습니다.'
+        )
+
     def _open_site(self, site_url: str) -> None:
         assert self.page
         self._wait_dashboard(require_input=False)
-        self._goto_tolerating_login_redirect(
-            self._site_console_url("summary", site_url)
-        )
+        self._click_registered_site(site_url)
         deadline = time.monotonic() + 60
         recovered = False
         while time.monotonic() < deadline:
@@ -455,11 +500,16 @@ class NaverBrowser:
                     raise NaverSessionError('로그인 후에도 인증 화면으로 돌아갑니다. 현재 로그인 계정과 서치어드바이저 접근 상태를 확인해 주세요.')
                 self.status('사이트 관리 화면 진입 중 재인증이 필요합니다. 로그인 완료 후 다시 진입합니다.')
                 self._wait_dashboard(require_input=False)
-                self._goto_tolerating_login_redirect(self._site_console_url('summary', site_url))
+                self._click_registered_site(site_url)
                 recovered = True
                 deadline = time.monotonic() + 60
                 continue
-            if self._visible(self.page.locator('a[href^="/console/site/option?site="]')):
+            location = urlsplit(self.page.url)
+            selected_site = parse_qs(location.query).get('site', [''])[0]
+            if (location.hostname == 'searchadvisor.naver.com'
+                    and location.path.startswith('/console/site/')
+                    and self._site_key(selected_site) == self._site_key(site_url)
+                    and self._console_link(self._settings_url(site_url))):
                 return
             self.page.wait_for_timeout(250)
         location = urlsplit(self.page.url)

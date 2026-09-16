@@ -5,7 +5,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from naver_browser import NAVER_DASHBOARD, NaverBrowser
+from naver_browser import NAVER_DASHBOARD, NaverAutomationError, NaverBrowser
 
 
 class LoginBrowserTests(unittest.TestCase):
@@ -117,15 +117,57 @@ class LoginBrowserTests(unittest.TestCase):
         self.assertTrue(any(c['name'] == 'callback_done' for c in self.context.cookies()))
 
     def test_site_auth_redirect_recovers_after_callback(self):
+        target = self.helper._site_console_url('summary', 'https://example.pages.dev')
+        settings = self.helper._settings_url('https://example.pages.dev')
+        self.context.route(NAVER_DASHBOARD, lambda route: route.fulfill(
+            content_type='text/html', body=f'<a href="{target}">Site</a><script>fetch("/api-board/list/current")</script>'))
         visits = []
         def site_route(route):
             visits.append(route.request.url)
             if len(visits) == 1:
                 route.fulfill(content_type='text/html', body="<script>setTimeout(() => location.href='/auth/callback?code=test-only', 100)</script>")
             else:
-                route.fulfill(content_type='text/html', body='<a href="/console/site/option?site=test">Settings</a>')
+                route.fulfill(content_type='text/html', body=f'<a href="{settings}">Settings</a>')
         self.context.route('**/console/site/summary*', site_route)
         self.context.route('**/auth/callback*', lambda route: route.fulfill(
             content_type='text/html', body="<script>setTimeout(() => location.href='/console/board', 1800)</script>"))
         self.helper._open_site('https://example.pages.dev')
         self.assertEqual(len(visits), 2)
+
+    def test_delayed_registered_link_with_different_encoding_uses_spa_navigation(self):
+        self.context.route(NAVER_DASHBOARD, lambda route: route.fulfill(
+            content_type='text/html', body='''<script>
+            window.authMarker = 'keep';
+            fetch('/api-board/list/current');
+            setTimeout(() => {
+              const a = document.createElement('a');
+              a.href = '/console/site/summary?site=https%3a%2f%2fexample.pages.dev%2f';
+              a.textContent = 'Registered site';
+              a.onclick = e => {
+                e.preventDefault(); history.pushState({}, '', a.href);
+                const settings = document.createElement('a');
+                settings.href = '/console/site/option?site=https%3A%2F%2Fexample.pages.dev%2F';
+                settings.textContent = 'Settings'; document.body.appendChild(settings);
+              };
+              document.body.appendChild(a);
+            }, 1200);
+            </script>'''))
+        self.helper._open_site('https://example.pages.dev')
+        self.assertEqual(self.helper.page.evaluate('window.authMarker'), 'keep')
+
+    def test_missing_site_does_not_open_guessed_url_or_login(self):
+        self.helper._wait_dashboard(timeout_seconds=5, require_input=False)
+        with self.assertRaisesRegex(NaverAutomationError, '관리 링크'):
+            self.helper._click_registered_site('https://missing.pages.dev', timeout_seconds=0.3)
+        self.assertEqual(self.helper.page.url, NAVER_DASHBOARD)
+        self.assertEqual(self.login_visits, 0)
+
+    def test_registered_site_matching_keeps_protocol_and_host_distinct(self):
+        self.helper.page.goto(NAVER_DASHBOARD)
+        self.helper.page.evaluate('''() => {
+            document.body.innerHTML += '<a href="/console/site/summary?site=http%3A%2F%2Fexample.pages.dev">HTTP</a>';
+        }''')
+        self.assertIsNone(self.helper._console_link(
+            self.helper._site_console_url('summary', 'https://example.pages.dev')))
+        self.assertIsNone(self.helper._console_link(
+            self.helper._site_console_url('summary', 'http://other.pages.dev')))
