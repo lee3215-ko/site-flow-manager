@@ -9,6 +9,19 @@ from naver_browser import NAVER_DASHBOARD, NaverBrowser
 
 
 class LoginBrowserTests(unittest.TestCase):
+    def test_rotating_cookies_do_not_reload_dashboard_before_delayed_response(self):
+        visits = []
+        def dashboard(route):
+            visits.append(route.request.url)
+            route.fulfill(content_type='text/html', body="""<script>
+                setInterval(() => document.cookie='NID_SES='+Date.now()+'; domain=.naver.com; path=/; Secure', 150);
+                setTimeout(() => fetch('/api-board/list/current'), 2200);
+                </script>""")
+        self.context.route(NAVER_DASHBOARD, dashboard)
+        self.helper._wait_dashboard(timeout_seconds=7, require_input=False)
+        self.assertEqual(len(visits), 1)
+        self.assertIsNotNone(self.helper.board_payload)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

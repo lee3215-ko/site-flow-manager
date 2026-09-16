@@ -286,13 +286,13 @@ class NaverBrowser:
     def _wait_dashboard(self, timeout_seconds: int = 600, require_input: bool = True):
         self.select_live_page()
         self.board_payload = None
-        session = self._login_session()
         waiting_login = self._is_login_page(self.page)
         if not waiting_login:
             self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
         deadline = time.monotonic() + timeout_seconds
         login_notified = False
         callback_started = None
+        navigated_locations = set()
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise NaverAutomationError("네이버 로그인 대기를 중지했습니다.")
@@ -300,11 +300,9 @@ class NaverBrowser:
                 raise NaverAutomationError("네이버 창이 모두 닫혔습니다. 로그인 창을 다시 열어 주세요.")
             previous_page = self.page
             self.select_live_page()
-            current_session = self._login_session()
-            session_changed = current_session != session
-            session = current_session
             on_login = self._is_login_page(self.page)
             url = urlsplit(self.page.url)
+            on_dashboard = url.hostname == 'searchadvisor.naver.com' and url.path.rstrip('/') == '/console/board'
             if url.hostname == 'searchadvisor.naver.com' and url.path.startswith('/auth/'):
                 if callback_started is None:
                     callback_started = time.monotonic()
@@ -313,17 +311,23 @@ class NaverBrowser:
                     raise NaverAutomationError('네이버 인증 콜백이 60초 이상 완료되지 않았습니다. 열린 창에서 서치어드바이저 홈으로 이동해 다시 로그인해 주세요. 소유확인 실패로 판정한 것은 아닙니다.')
             else:
                 callback_started = None
-            if session_changed:
+            if on_login:
                 self.board_payload = None
-            if not on_login and (waiting_login or previous_page != self.page or session_changed):
+            if not on_login and not on_dashboard and (waiting_login or previous_page != self.page):
+                location = (self.page, url.hostname, url.path)
+                if location in navigated_locations or len(navigated_locations) >= 2:
+                    raise NaverAutomationError('네이버 인증 후 같은 화면으로 반복 이동했습니다. 자동 이동을 중단했습니다. 열린 창에서 로그인을 완료한 뒤 다시 시도해 주세요.')
+                navigated_locations.add(location)
                 self.board_payload = None
                 self.status("새 네이버 로그인 상태로 서치어드바이저를 확인합니다.")
                 self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
             waiting_login = self._is_login_page(self.page)
-            if not waiting_login and not require_input and self.board_payload is not None:
+            current = urlsplit(self.page.url)
+            dashboard_ready = current.hostname == 'searchadvisor.naver.com' and current.path.rstrip('/') == '/console/board'
+            if dashboard_ready and not require_input and self.board_payload is not None:
                 self.context.storage_state(path=str(self.state_file))
                 return None
-            field = None if waiting_login else self._visible(self.page.locator('input[maxlength="253"][type="text"]'))
+            field = self._visible(self.page.locator('input[maxlength="253"][type="text"]')) if dashboard_ready else None
             if require_input and field:
                 self.context.storage_state(path=str(self.state_file))
                 return field
