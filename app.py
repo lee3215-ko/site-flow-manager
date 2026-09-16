@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from cloudflare_client import CloudflareAccountPool, CloudflareClient
-from naver_browser import NaverBrowser, automation_self_test, settings_page_self_test
+from naver_browser import NaverBrowser, automation_self_test, settings_page_self_test, session_failure
 from naver_tools import check_public_files, load_manifest, verify_public_deployment
 from secret_store import load_secret, save_secret
 from version import APP_VERSION
@@ -1246,6 +1246,8 @@ class PublisherApp(tk.Tk):
                         )
                         project.deployment_verified = "완료"
                         manifest = load_manifest(Path(project.site_root))
+                        if self.cancel_event.is_set():
+                            break
                         self._checkpoint(project, f"[{index}/{len(candidates)}] 네이버 후속 작업: {project.url}")
                         completed_steps = set()
                         if project.frequency in {"빠르게", "완료", "완료 (빠르게)"}:
@@ -1290,6 +1292,9 @@ class PublisherApp(tk.Tk):
                                 setattr(project, field_name, "실패")
                         self._checkpoint(project, f"{project.name} 후속 작업 실패: {exc}")
                         errors.append(f"{project.name}: {exc}")
+                        if session_failure(exc) or self.cancel_event.is_set():
+                            self._status('인증·브라우저 오류 또는 중지 요청으로 후속 일괄 작업을 종료했습니다. 나머지 사이트는 처리하지 않았습니다.')
+                            break
             return completed, errors, self.cancel_event.is_set()
 
         def done(result):

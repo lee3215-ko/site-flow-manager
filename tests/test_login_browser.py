@@ -9,6 +9,19 @@ from naver_browser import NAVER_DASHBOARD, NaverBrowser
 
 
 class LoginBrowserTests(unittest.TestCase):
+    def test_internal_link_preserves_document_authentication_state(self):
+        target = self.helper._site_console_url('summary', 'https://example.pages.dev')
+        self.helper.page.goto(NAVER_DASHBOARD)
+        self.helper.page.evaluate('window.authMarker = "keep"')
+        self.helper.page.evaluate('''target => {
+            const a = document.createElement('a'); a.href = target; a.textContent = 'Site';
+            a.onclick = e => {e.preventDefault(); history.pushState({}, '', target);};
+            document.body.appendChild(a);
+        }''', target)
+        self.helper._goto_tolerating_login_redirect(target)
+        self.assertEqual(self.helper.page.evaluate('window.authMarker'), 'keep')
+        self.assertEqual(self.helper.page.url, target)
+
     def test_rotating_cookies_do_not_reload_dashboard_before_delayed_response(self):
         visits = []
         def dashboard(route):

@@ -28,6 +28,14 @@ NAVER_DASHBOARD = "https://searchadvisor.naver.com/console/board"
 class NaverAutomationError(RuntimeError):
     pass
 
+class NaverSessionError(NaverAutomationError):
+    """Authentication or browser failure: stop the batch, not just one site."""
+
+def session_failure(error):
+    return isinstance(error, NaverSessionError) or (
+        isinstance(error, PlaywrightError) and 'closed' in str(error).lower()
+    )
+
 
 class NaverBrowser:
     def __init__(
@@ -223,6 +231,30 @@ class NaverBrowser:
 
     def _goto_tolerating_login_redirect(self, url: str) -> None:
         assert self.page
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise NaverSessionError('네이버 작업을 중지했습니다.')
+        if self.page.is_closed():
+            raise NaverSessionError('네이버 창이 닫혀 일괄 작업을 중단합니다.')
+        current, target = urlsplit(self.page.url), urlsplit(url)
+        if current.hostname == target.hostname == 'searchadvisor.naver.com' and not self._is_login_page(self.page):
+            if current.path == target.path and current.query == target.query:
+                return
+            relative = target.path + ('?' + target.query if target.query else '')
+            selector = f'a[href="{relative}"], a[href="{url}"]'
+            link = self._visible(self.page.locator(selector))
+            if not link:
+                group = '검증' if '/check/' in target.path else ('요청' if '/request/' in target.path else None)
+                if group:
+                    button = self._visible(self.page.get_by_role('button').filter(has_text=group))
+                    if button and button.get_attribute('aria-expanded') != 'true':
+                        button.click()
+                        self.page.wait_for_timeout(300)
+                        link = self._visible(self.page.locator(selector))
+            if link:
+                self.status(f'네이버 내부 링크로 이동: {target.path}')
+                link.click()
+                return
+        self.status(f'네이버 페이지 열기: {target.hostname}{target.path}')
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         except PlaywrightError as exc:
@@ -285,7 +317,10 @@ class NaverBrowser:
 
     def _wait_dashboard(self, timeout_seconds: int = 600, require_input: bool = True):
         self.select_live_page()
-        self.board_payload = None
+        # Keep the current dashboard response when no document navigation is needed.
+        current = urlsplit(self.page.url)
+        if current.hostname != 'searchadvisor.naver.com' or current.path.rstrip('/') != '/console/board':
+            self.board_payload = None
         waiting_login = self._is_login_page(self.page)
         if not waiting_login:
             self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
@@ -295,9 +330,9 @@ class NaverBrowser:
         navigated_locations = set()
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
-                raise NaverAutomationError("네이버 로그인 대기를 중지했습니다.")
+                raise NaverSessionError("네이버 로그인 대기를 중지했습니다.")
             if not any(not page.is_closed() for page in self.context.pages):
-                raise NaverAutomationError("네이버 창이 모두 닫혔습니다. 로그인 창을 다시 열어 주세요.")
+                raise NaverSessionError("네이버 창이 모두 닫혔습니다. 로그인 창을 다시 열어 주세요.")
             previous_page = self.page
             self.select_live_page()
             on_login = self._is_login_page(self.page)
@@ -308,7 +343,7 @@ class NaverBrowser:
                     callback_started = time.monotonic()
                     self.status('네이버 인증 완료를 기다립니다. 인증 중에는 페이지를 이동하지 않습니다.')
                 elif time.monotonic() - callback_started > 60:
-                    raise NaverAutomationError('네이버 인증 콜백이 60초 이상 완료되지 않았습니다. 열린 창에서 서치어드바이저 홈으로 이동해 다시 로그인해 주세요. 소유확인 실패로 판정한 것은 아닙니다.')
+                    raise NaverSessionError('네이버 인증 콜백이 60초 이상 완료되지 않았습니다. 열린 창에서 서치어드바이저 홈으로 이동해 다시 로그인해 주세요. 소유확인 실패로 판정한 것은 아닙니다.')
             else:
                 callback_started = None
             if on_login:
@@ -316,7 +351,7 @@ class NaverBrowser:
             if not on_login and not on_dashboard and (waiting_login or previous_page != self.page):
                 location = (self.page, url.hostname, url.path)
                 if location in navigated_locations or len(navigated_locations) >= 2:
-                    raise NaverAutomationError('네이버 인증 후 같은 화면으로 반복 이동했습니다. 자동 이동을 중단했습니다. 열린 창에서 로그인을 완료한 뒤 다시 시도해 주세요.')
+                    raise NaverSessionError('네이버 인증 후 같은 화면으로 반복 이동했습니다. 자동 이동을 중단했습니다. 열린 창에서 로그인을 완료한 뒤 다시 시도해 주세요.')
                 navigated_locations.add(location)
                 self.board_payload = None
                 self.status("새 네이버 로그인 상태로 서치어드바이저를 확인합니다.")
@@ -339,7 +374,7 @@ class NaverBrowser:
             except PlaywrightError:
                 if not self.page.is_closed():
                     raise
-        raise NaverAutomationError("네이버 로그인 또는 웹마스터 도구 화면 대기 시간이 초과되었습니다.")
+        raise NaverSessionError("네이버 로그인 또는 웹마스터 도구 화면 대기 시간이 초과되었습니다.")
 
     def register_and_download(self, site_url: str, download_dir: Path) -> Path:
         assert self.page
@@ -417,7 +452,7 @@ class NaverBrowser:
             self.select_live_page()
             if self._is_login_page(self.page):
                 if recovered:
-                    raise NaverAutomationError('로그인 후에도 인증 화면으로 돌아갑니다. 현재 로그인 계정과 서치어드바이저 접근 상태를 확인해 주세요.')
+                    raise NaverSessionError('로그인 후에도 인증 화면으로 돌아갑니다. 현재 로그인 계정과 서치어드바이저 접근 상태를 확인해 주세요.')
                 self.status('사이트 관리 화면 진입 중 재인증이 필요합니다. 로그인 완료 후 다시 진입합니다.')
                 self._wait_dashboard(require_input=False)
                 self._goto_tolerating_login_redirect(self._site_console_url('summary', site_url))
@@ -506,6 +541,10 @@ class NaverBrowser:
             self._goto_tolerating_login_redirect(target_url)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    raise NaverSessionError('네이버 작업을 중지했습니다.')
+                if self.page.is_closed() or self._is_login_page(self.page):
+                    raise NaverSessionError('네이버 인증 또는 브라우저 상태가 변경되어 일괄 작업을 중단합니다. 로그인 상태를 확인해 주세요.')
                 candidate = self._visible(ready())
                 if candidate and f"/console/site/{route}" in self.page.url:
                     return candidate
