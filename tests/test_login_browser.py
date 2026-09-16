@@ -171,3 +171,27 @@ class LoginBrowserTests(unittest.TestCase):
             self.helper._site_console_url('summary', 'https://example.pages.dev')))
         self.assertIsNone(self.helper._console_link(
             self.helper._site_console_url('summary', 'http://other.pages.dev')))
+
+    def test_registered_row_click_handler_without_href(self):
+        self.context.route(NAVER_DASHBOARD, lambda route: route.fulfill(
+            content_type='text/html', body='''
+            <input value="https://example.pages.dev">
+            <table><tbody><tr><td><a id="site">https://example.pages.dev</a></td><td>26.09.15</td></tr></tbody></table>
+            <script>
+            window.authMarker = 'keep'; fetch('/api-board/list/current');
+            document.getElementById('site').onclick = () => {
+                history.pushState({}, '', '/console/site/summary?site=https%3A%2F%2Fexample.pages.dev');
+                document.body.innerHTML = '<a href="/console/site/option?site=https%3A%2F%2Fexample.pages.dev">Settings</a>';
+            };
+            </script>'''))
+        self.helper._open_site('https://example.pages.dev')
+        self.assertEqual(self.helper.page.evaluate('window.authMarker'), 'keep')
+
+    def test_row_match_ignores_input_and_similar_addresses(self):
+        self.helper.page.goto(NAVER_DASHBOARD)
+        self.helper.page.evaluate('''() => {
+            document.body.innerHTML = '<input value="https://example.pages.dev">'
+              + '<table><tbody><tr><td><a>https://example.pages.dev.evil.test</a></td></tr>'
+              + '<tr><td><a>http://example.pages.dev</a></td></tr></tbody></table>';
+        }''')
+        self.assertIsNone(self.helper._registered_site_text('https://example.pages.dev'))

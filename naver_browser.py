@@ -474,6 +474,8 @@ class NaverBrowser:
             if self.page.is_closed() or self._is_login_page(self.page):
                 raise NaverSessionError('사이트 목록 확인 중 인증 상태가 변경되었습니다. 열린 창을 확인해 주세요.')
             link = self._console_link(target)
+            if not link:
+                link = self._registered_site_text(site_url)
             if link:
                 self.status(f'네이버 등록 목록의 사이트 링크 클릭: {site_url}')
                 link.click()
@@ -484,6 +486,27 @@ class NaverBrowser:
             '현재 계정에 등록된 주소(http/https 포함), 소유확인 상태와 목록의 검색·페이지를 확인해 주세요. '
             '주소를 추측해 열거나 재로그인을 요청하지 않았습니다.'
         )
+
+    def _registered_site_text(self, site_url: str) -> Locator | None:
+        # Some dashboard entries use click handlers without a navigable href.
+        # Restrict matching to list rows, never the URL registration/search input.
+        expected = self._site_key(site_url)
+        try:
+            entries = self.page.locator('tbody tr, [role="row"], [role="listitem"]')
+            for index in range(entries.count()):
+                row = entries.nth(index)
+                if not row.is_visible():
+                    continue
+                for text in row.inner_text().split():
+                    text = text.strip()
+                    if not text.startswith(('http://', 'https://')) or self._site_key(text) != expected:
+                        continue
+                    match = self._visible(row.get_by_text(text, exact=True))
+                    if match:
+                        return match
+        except PlaywrightError:
+            return None
+        return None
 
     def _open_site(self, site_url: str) -> None:
         assert self.page
