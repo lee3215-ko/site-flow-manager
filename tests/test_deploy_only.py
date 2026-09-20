@@ -18,6 +18,7 @@ class DeployOnlyTests(unittest.TestCase):
             archive.touch()
             project = Project('sample', str(archive), str(root), 'https://sample.pages.dev')
             app = Mock()
+            app.settings = {}
             app.deploy_only_var.get.return_value = True
             app._delay_range.return_value = (0, 0)
             app._selected_many.return_value = [project]
@@ -30,6 +31,7 @@ class DeployOnlyTests(unittest.TestCase):
             verification = Path(directory) / 'naver123.html'
             verification.write_text('naver-site-verification: naver123.html')
             browser = Mock()
+            browser.login_account = 'registered-user'
             browser.register_and_download.return_value = verification
             app._get_naver_browser.return_value = browser
             with patch('app.messagebox.askokcancel', return_value=True), patch('deployment_runtime.preflight'), patch('app.CloudflareAccountPool', return_value=pool), patch('app.verify_public_deployment') as verify, patch('app.move_zip_to_success', return_value=archive):
@@ -49,3 +51,4 @@ class DeployOnlyTests(unittest.TestCase):
                 browser.register_and_download.assert_called_once()
                 self.assertEqual(client.deploy.call_count, 2)
                 self.assertTrue((root / verification.name).is_file())
+                self.assertEqual(project.naver_account, 'registered-user')

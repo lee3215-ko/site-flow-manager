@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import socket
@@ -56,6 +57,11 @@ class NaverBrowser:
         self.page: Page | None = None
         self.cancel_event = None
         self.board_payload = None
+        self.login_account = ''
+        self._pending_login_account = ''
+        self._account_input_page = None
+        self._saving_state = False
+        self._work_page = None
 
     def _chromium_path(self) -> Path:
         app_dir = (
@@ -150,6 +156,7 @@ class NaverBrowser:
                 f"실제 원인: {exc}"
             ) from exc
         self.context.on("response", self._capture_board_response)
+        self._install_account_capture()
         self.page = self.context.new_page()
         for browser_context in self.browser.contexts:
             if browser_context == self.context:
@@ -161,11 +168,56 @@ class NaverBrowser:
                     pass
         return self
 
+    def _capture_login_account(self, source, value) -> None:
+        if self._saving_state:
+            return
+        frame = source.get('frame')
+        page = source.get('page')
+        if not frame or not page or frame != page.main_frame or urlsplit(frame.url).hostname != 'nid.naver.com':
+            return
+        if not isinstance(value, str) or len(value) > 254:
+            return
+        value = value.strip()
+        if any(char.isspace() for char in value):
+            return
+        self.login_account = ''
+        self._pending_login_account = value
+        self._account_input_page = page
+
+    def _install_account_capture(self) -> None:
+        self.context.expose_binding('siteflowAccountInput', self._capture_login_account)
+        self.context.add_init_script('''(() => {
+          if (location.hostname !== 'nid.naver.com' || window !== window.top) return;
+          const report = () => {
+            const field = document.querySelector('input#id:not([type="password"])');
+            window.siteflowAccountInput(field ? field.value : '').catch(() => {});
+          };
+          report();
+          document.addEventListener('DOMContentLoaded', report, {once: true});
+          for (const event of ['input', 'change']) {
+            document.addEventListener(event, e => {
+              if (e.target.matches('input#id:not([type="password"])')) report();
+            }, true);
+          }
+          document.addEventListener('submit', report, true);
+        })();''')
+
+    def _save_authenticated_state(self) -> None:
+        # Playwright may create temporary origin pages while reading local storage.
+        # Their empty login inputs must not replace the user's captured account.
+        self._saving_state = True
+        try:
+            self.context.storage_state(path=str(self.state_file))
+        finally:
+            self._saving_state = False
+        if self._account_input_page == self.page:
+            self.login_account = self._pending_login_account
+
     def _close_browser(self, save_state: bool) -> None:
         if self.context:
             if save_state:
                 try:
-                    self.context.storage_state(path=str(self.state_file))
+                    self._save_authenticated_state()
                 except Exception as state_exc:
                     self.status(f"네이버 로그인 상태 저장 실패: {state_exc}")
             try:
@@ -240,6 +292,9 @@ class NaverBrowser:
             if current.path == target.path and current.query == target.query:
                 return
             link = self._console_link(url)
+            if not link and self._at_site(parse_qs(target.query).get('site', [''])[0]):
+                if target.path == '/console/site/option':
+                    link = self._settings_control()
             if not link:
                 group = '검증' if '/check/' in target.path else ('요청' if '/request/' in target.path else None)
                 if group:
@@ -358,11 +413,11 @@ class NaverBrowser:
             current = urlsplit(self.page.url)
             dashboard_ready = current.hostname == 'searchadvisor.naver.com' and current.path.rstrip('/') == '/console/board'
             if dashboard_ready and not require_input and self.board_payload is not None:
-                self.context.storage_state(path=str(self.state_file))
+                self._save_authenticated_state()
                 return None
             field = self._visible(self.page.locator('input[maxlength="253"][type="text"]')) if dashboard_ready else None
             if require_input and field:
-                self.context.storage_state(path=str(self.state_file))
+                self._save_authenticated_state()
                 return field
             if not login_notified:
                 self.status("네이버 로그인이 필요하면 열린 Chromium에서 로그인해 주세요. 최대 10분간 기다립니다.")
@@ -510,10 +565,23 @@ class NaverBrowser:
 
     def _open_site(self, site_url: str) -> None:
         assert self.page
+        if self._site_management_ready(site_url):
+            self.status(f'이미 열린 사이트 관리 화면 확인: {site_url}')
+            return
+        previous_work = self._work_page
+        self.page = self.context.new_page()
+        self._work_page = self.page
+        self.board_payload = None
+        self.status(f'사이트별 새 작업 탭 준비 (로그인 세션 유지): {site_url}')
+        self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
+        if previous_work and not previous_work.is_closed():
+            previous_work.close()
         self._wait_dashboard(require_input=False)
         self._click_registered_site(site_url)
         deadline = time.monotonic() + 60
         recovered = False
+        menu_reloaded = False
+        stale_since = None
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise NaverAutomationError('네이버 사이트 관리 화면 대기를 중지했습니다.')
@@ -527,20 +595,147 @@ class NaverBrowser:
                 recovered = True
                 deadline = time.monotonic() + 60
                 continue
-            location = urlsplit(self.page.url)
-            selected_site = parse_qs(location.query).get('site', [''])[0]
-            if (location.hostname == 'searchadvisor.naver.com'
-                    and location.path.startswith('/console/site/')
-                    and self._site_key(selected_site) == self._site_key(site_url)
-                    and self._console_link(self._settings_url(site_url))):
+            if self._site_management_ready(site_url):
+                self.status(f'사이트 관리 화면 확인: {site_url}')
                 return
+            stale_site = self._stale_menu_site(site_url)
+            if stale_site:
+                if stale_since is None:
+                    stale_since = time.monotonic()
+                elif time.monotonic() - stale_since >= 1:
+                    if menu_reloaded:
+                        self._save_navigation_diagnostic(site_url)
+                        raise NaverSessionError('새로고침 후에도 이전 사이트 메뉴가 남아 있습니다. 다른 사이트에 요청하지 않고 일괄 작업을 중단합니다.')
+                    self.status(f'이전 사이트 메뉴 감지: {stale_site} → {site_url}. 현재 화면을 한 번 새로고침합니다.')
+                    self.page.reload(wait_until='domcontentloaded', timeout=60_000)
+                    menu_reloaded = True
+                    stale_since = None
+                    deadline = time.monotonic() + 60
+                    continue
+            else:
+                stale_since = None
             self.page.wait_for_timeout(250)
         location = urlsplit(self.page.url)
+        self._save_navigation_diagnostic(site_url)
         raise NaverAutomationError(
-            f'{site_url}의 사이트 관리 화면을 열지 못했습니다. '
-            '현재 계정의 사이트 등록·소유확인 상태 또는 화면 변경을 확인해 주세요. '
+            f'{site_url}의 사이트 관리 화면 준비를 확인하지 못했습니다. '
+            f'요청 사이트 주소 일치: {self._at_site(site_url)}, 설정 메뉴 표시: {bool(self._settings_control())}. '
             f'현재 위치: {location.hostname}{location.path}'
         )
+
+    def _stale_menu_site(self, site_url: str) -> str | None:
+        if not self._at_site(site_url):
+            return None
+        try:
+            links = self.page.locator('[role="list"] a[href]')
+            for index in range(links.count()):
+                link = links.nth(index)
+                if not link.is_visible():
+                    continue
+                target = urlsplit(urljoin(self.page.url, link.get_attribute('href') or ''))
+                if target.hostname != 'searchadvisor.naver.com' or target.path != '/console/site/option':
+                    continue
+                linked_site = parse_qs(target.query).get('site', [''])[0]
+                if linked_site and self._site_key(linked_site) != self._site_key(site_url):
+                    return linked_site
+        except PlaywrightError:
+            return None
+        return None
+
+    def _save_navigation_diagnostic(self, site_url: str) -> None:
+        try:
+            data = self.page.locator('body').evaluate('''body => {
+                const safeUrl = value => {
+                    try {
+                        const u = new URL(value, location.href);
+                        return {host: u.hostname, path: u.pathname, site: u.searchParams.get('site')};
+                    } catch { return null; }
+                };
+                return {
+                    location: safeUrl(location.href),
+                    viewport: {width: innerWidth, height: innerHeight},
+                    menus: Array.from(body.querySelectorAll('a, [role="listitem"], [role="button"]')).slice(0, 250).map(el => {
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return {text: (el.textContent || '').trim().slice(0, 120),
+                            target: el.hasAttribute('href') ? safeUrl(el.getAttribute('href')) : null,
+                            tag: el.tagName, role: el.getAttribute('role'),
+                            inList: !!el.closest('[role="list"]'),
+                            visible: !!(rect.width && rect.height && style.visibility !== 'hidden' && style.display !== 'none'),
+                            classes: el.className.toString().slice(0, 180)};
+                    })
+                };
+            }''')
+            data['requested_site'] = site_url
+            data['conflicting_site_heading'] = self._conflicting_site_heading(site_url)
+            data['captured_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            path = self.profile_dir / 'diagnostics' / 'navigation-latest.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            self.status(f'메뉴 진단 기록 저장: {path}')
+        except Exception:
+            self.status('메뉴 진단 기록을 저장하지 못했습니다. 열린 화면을 유지해 주세요.')
+
+    def _at_site(self, site_url: str) -> bool:
+        if not site_url or not self.page or self.page.is_closed():
+            return False
+        location = urlsplit(self.page.url)
+        selected = parse_qs(location.query).get('site', [''])[0]
+        return (location.hostname == 'searchadvisor.naver.com'
+                and location.path.startswith('/console/site/')
+                and self._site_key(selected) == self._site_key(site_url))
+
+    def _settings_control(self) -> Locator | None:
+        # Only the site sidebar, never the global "tool settings" navigation.
+        controls = self.page.locator('[role="list"] a, [role="list"] [role="listitem"], [role="list"] [role="button"]')
+        try:
+            for index in range(controls.count()):
+                control = controls.nth(index)
+                if not control.is_visible():
+                    continue
+                label = ' '.join(control.inner_text().split())
+                if not re.fullmatch(r'(?:settings\s*)?설정', label):
+                    continue
+                href = control.get_attribute('href')
+                if href is None and control.locator('a').count():
+                    continue
+                if href and href != '#':
+                    target = urlsplit(urljoin(self.page.url, href))
+                    site = parse_qs(target.query).get('site', [''])[0]
+                    if (target.hostname != 'searchadvisor.naver.com'
+                            or target.path != '/console/site/option'
+                            or not self._at_site(site)):
+                        continue
+                return control
+        except PlaywrightError:
+            return None
+        return None
+
+    def _site_management_ready(self, site_url: str) -> bool:
+        return self._at_site(site_url) and not self._stale_menu_site(site_url) and not self._conflicting_site_heading(site_url) and bool(
+            self._console_link(self._settings_url(site_url)) or self._settings_control()
+        )
+
+    def _conflicting_site_heading(self, site_url: str) -> str | None:
+        # The selected-site banner is plain URL text, not a sidebar/table link.
+        candidates = self.page.get_by_text(re.compile(r'^https?://[^\s]+$'))
+        for index in range(candidates.count()):
+            item = candidates.nth(index)
+            if not item.is_visible() or item.evaluate('(el) => !!el.closest("a, table, [role=list], [role=row], input, textarea")'):
+                continue
+            value = item.inner_text().strip()
+            parsed = urlsplit(value)
+            if parsed.path not in ('', '/') or parsed.query or parsed.fragment:
+                continue
+            if self._site_key(value) != self._site_key(site_url):
+                return value
+        return None
+
+    def _assert_site_identity(self, site_url: str) -> None:
+        if (not self._at_site(site_url) or self._stale_menu_site(site_url)
+                or self._conflicting_site_heading(site_url)):
+            self._save_navigation_diagnostic(site_url)
+            raise NaverSessionError('주소창·메뉴·본문의 사이트가 일치하지 않아 요청을 보내지 않고 중단했습니다.')
 
     def _section(self, heading: str) -> Locator:
         assert self.page
@@ -619,7 +814,7 @@ class NaverBrowser:
                 if self.page.is_closed() or self._is_login_page(self.page):
                     raise NaverSessionError('네이버 인증 또는 브라우저 상태가 변경되어 일괄 작업을 중단합니다. 로그인 상태를 확인해 주세요.')
                 candidate = self._visible(ready())
-                if candidate and f"/console/site/{route}" in self.page.url:
+                if candidate and urlsplit(self.page.url).path == f"/console/site/{route}" and self._at_site(site_url):
                     return candidate
                 self.page.wait_for_timeout(250)
             if attempt < 3:
@@ -641,11 +836,35 @@ class NaverBrowser:
             raise NaverAutomationError(
                 "네이버 설정 화면에서 수집 주기 '빠르게' 항목을 60초 안에 찾지 못했습니다."
             ) from exc
-        if not fast.is_checked():
-            fast.check(force=True)
-            self.page.wait_for_timeout(2_000)
-        if not self.page.locator('input[type="radio"][value="fast"]').first.is_checked():
-            raise NaverAutomationError("네이버 수집 주기를 '빠르게'로 변경하지 못했습니다.")
+        if not self._at_site(site_url) or urlsplit(self.page.url).path != '/console/site/option':
+            raise NaverAutomationError('설정 화면의 사이트 주소가 요청한 사이트와 달라 변경하지 않았습니다.')
+        self._assert_site_identity(site_url)
+        if fast.is_checked():
+            self.status("수집 주기가 이미 '빠르게'로 선택되어 있습니다.")
+            return
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise NaverSessionError('네이버 작업을 중지했습니다.')
+        # Vuetify overlays the native input. Click its visible label instead.
+        group = fast.locator('xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " v-radio ")][1]')
+        label = group.locator('label').filter(has_text=re.compile(r'^\s*빠르게\s*$'))
+        if label.count():
+            label.first.click(timeout=15_000)
+        else:
+            self.page.get_by_label('빠르게', exact=True).check(timeout=15_000)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise NaverSessionError('네이버 작업을 중지했습니다.')
+            if not self._at_site(site_url) or urlsplit(self.page.url).path != '/console/site/option':
+                raise NaverSessionError('수집 주기 확인 중 사이트 또는 로그인 화면이 바뀌어 중단했습니다.')
+            self._raise_visible_error()
+            if fast.is_checked():
+                self.page.wait_for_timeout(500)
+                self._raise_visible_error()
+                if fast.is_checked():
+                    return
+            self.page.wait_for_timeout(200)
+        raise NaverAutomationError("'빠르게' 라벨을 클릭했지만 선택 상태가 유지되지 않았습니다. 완료로 기록하지 않았습니다.")
 
     def request_robots(self, site_url: str) -> None:
         assert self.page
@@ -656,6 +875,7 @@ class NaverBrowser:
             lambda: self.page.get_by_role("button", name="수집요청", exact=True),
             "robots.txt",
         )
+        self._assert_site_identity(site_url)
         self._click_and_confirm_api(
             request_button, "/api-console/check/robots", "robots.txt 수집"
         )
@@ -672,6 +892,7 @@ class NaverBrowser:
             "사이트맵 제출",
         )
         sitemap_url = site_url.rstrip("/") + "/sitemap.xml"
+        self._assert_site_identity(site_url)
         if self._visible(self.page.locator(f'a[href="{sitemap_url}"]')):
             return
         button = self.page.get_by_role("button", name="확인", exact=True).first
@@ -682,6 +903,7 @@ class NaverBrowser:
                 "네이버 사이트맵 제출 화면의 확인 버튼을 찾지 못했습니다."
             ) from exc
         self._type_like_user(page_field, sitemap_url)
+        self._assert_site_identity(site_url)
         self._click_and_confirm_api(
             button, "/api-console/request/sitemap", "사이트맵 제출"
         )
@@ -718,6 +940,7 @@ class NaverBrowser:
                 urls.append(value)
         requested = 0
         for index, url in enumerate(urls[:maximum], start=1):
+            self._assert_site_identity(site_url)
             self.status(f"페이지 수집 요청 {index}/{min(len(urls), maximum)}: {url}")
             existing = self._visible(self.page.locator(f'a[href="{url}"]'))
             if existing:
@@ -731,6 +954,7 @@ class NaverBrowser:
                     "네이버 페이지 수집 요청 화면의 확인 버튼을 찾지 못했습니다."
                 ) from exc
             self._type_like_user(page_field, url)
+            self._assert_site_identity(site_url)
             self._click_and_confirm_api(
                 button, "/api-console/request/crawl", "웹 페이지 수집"
             )

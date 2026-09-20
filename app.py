@@ -119,6 +119,7 @@ class PublisherApp(tk.Tk):
         self._nav_button(nav, "선택 사이트 SEO 재배포", self.redeploy_seo)
         self._nav_button(nav, "Cloudflare 설정", self.open_settings)
         self._nav_button(nav, "네이버 로그인 저장", self.open_naver_login)
+        self._nav_button(nav, "네이버 아이디 입력 / 수정", self.edit_naver_account)
         self._nav_button(nav, "연결 현황 새로고침", self.refresh_service_counts)
         self._nav_button(nav, "네이버 등록 수 확인", self.refresh_naver_count)
         self._nav_button(nav, "버전 확인 / 업데이트", self.check_updates)
@@ -198,6 +199,7 @@ class PublisherApp(tk.Tk):
         self.date_filter.bind('<<ComboboxSelected>>', lambda event: self._refresh_table())
         self.visible_count = tk.Label(filters, bg=self.COLORS['bg'])
         self.visible_count.pack(side='left', padx=12)
+        self._button(filters, '2단계 수동 완료 표시', self.mark_post_complete).pack(side='right', padx=7)
         self.deploy_only_var = tk.BooleanVar(value=False)
         tk.Checkbutton(filters, text='네이버 없이 배포만 (1단계)', variable=self.deploy_only_var,
                        bg=self.COLORS['bg']).pack(side='right', padx=8)
@@ -666,6 +668,8 @@ class PublisherApp(tk.Tk):
         browser = NaverBrowser(NAVER_PROFILE_DIR, self._status)
         browser.cancel_event = self.cancel_event
         browser.__enter__()
+        if browser.state_file.is_file():
+            browser.login_account = self.settings.get('last_naver_account', '')
         self.naver_browser = browser
         return browser
 
@@ -922,16 +926,38 @@ class PublisherApp(tk.Tk):
         else:
             clear_form()
 
+    def edit_naver_account(self) -> None:
+        if self.busy:
+            messagebox.showinfo(APP_TITLE, '현재 작업이 끝난 후 변경해 주세요.')
+            return
+        account = simpledialog.askstring(APP_TITLE, '현재 로그인한 네이버 아이디를 입력해 주세요.\n이후 1단계 등록에 사용하며 기존 사이트 기록은 변경하지 않습니다.',
+                                        initialvalue=self.settings.get('last_naver_account', ''), parent=self)
+        if account is None:
+            return
+        account = account.strip()
+        if not account or any(char.isspace() for char in account):
+            messagebox.showerror(APP_TITLE, '공백 없는 네이버 아이디를 입력해 주세요.')
+            return
+        self.settings['last_naver_account'] = account
+        if self.naver_browser:
+            self.naver_browser.login_account = account
+            self.naver_browser._account_input_page = None
+        self._save()
+        self._status(f'현재 네이버 아이디 저장: {account} (기존 사이트 기록 유지)')
+
     def open_naver_login(self) -> None:
         def login():
             browser = self._get_naver_browser()
             browser.wait_for_login()
-            return True
+            return browser.login_account
 
-        def done(_result):
+        def done(account):
+            self.settings['last_naver_account'] = account
+            self._save()
+            detail = f'\n기록할 네이버 아이디: {account}' if account else '\n아이디를 읽지 못했습니다. 네이버 아이디 입력 / 수정에서 한 번 입력해 주세요.'
             messagebox.showinfo(
                 APP_TITLE,
-                "네이버 로그인을 확인하고 저장했습니다.\n이제 1단계 또는 2단계 작업을 실행하세요.",
+                "네이버 로그인을 확인하고 저장했습니다." + detail + "\n이제 1단계 또는 2단계 작업을 실행하세요.",
             )
 
         self._background("네이버 자동화 로그인 창을 여는 중...", login, done)
@@ -1073,6 +1099,8 @@ class PublisherApp(tk.Tk):
                             install_verification_file(Path(project.site_root), verification)
                             project.verification_file = str(verification)
                             project.registration = "완료"
+                            project.naver_account = browser.login_account
+                            self.settings['last_naver_account'] = browser.login_account
                             project.cloudflare = "재배포 필요"
                             project.deployment_verified = "대기"
                             project.ownership = "캡차 대기"
@@ -1197,25 +1225,58 @@ class PublisherApp(tk.Tk):
                 + "\n".join(unverified[:10]),
             )
             return
-        naver_account = simpledialog.askstring(
-            APP_TITLE,
-            f"선택한 {len(selected)}개 사이트의 소유확인을 진행한 네이버 아이디를 입력해 주세요.",
-            initialvalue=self.settings.get("last_naver_account", ""),
-            parent=self,
-        )
-        if naver_account is None:
-            return
-        naver_account = naver_account.strip()
-        if not naver_account:
-            messagebox.showerror(APP_TITLE, "네이버 아이디를 입력해 주세요.")
-            return
+        naver_account = self.settings.get('last_naver_account', '').strip()
+        if any(not project.naver_account for project in selected) and not naver_account:
+            naver_account = simpledialog.askstring(
+                APP_TITLE,
+                f"선택한 {len(selected)}개 사이트의 소유확인을 진행한 네이버 아이디를 입력해 주세요.",
+                initialvalue=self.settings.get("last_naver_account", ""),
+                parent=self,
+            )
+            if naver_account is None:
+                return
+            naver_account = naver_account.strip()
+            if not naver_account:
+                messagebox.showerror(APP_TITLE, "네이버 아이디를 입력해 주세요.")
+                return
         if not messagebox.askyesno(APP_TITLE, f"선택한 {len(selected)}개 사이트의 네이버 소유확인을 직접 완료했습니까?"):
             return
-        self.settings["last_naver_account"] = naver_account
+        if naver_account:
+            self.settings["last_naver_account"] = naver_account
         for project in selected:
             project.ownership = "완료"
-            project.naver_account = naver_account
+            if not project.naver_account:
+                project.naver_account = naver_account
             project.last_error = ""
+        self._save()
+        self._refresh_table()
+
+    def mark_post_complete(self) -> None:
+        if self.busy:
+            messagebox.showinfo(APP_TITLE, '현재 작업이 끝난 후 진행해 주세요.')
+            return
+        selected = self._selected_many(default_all=False)
+        if not selected:
+            messagebox.showinfo(APP_TITLE, '수동 완료로 표시할 사이트를 선택해 주세요.')
+            return
+        candidates = [p for p in selected if not p.crawl.startswith('완료')]
+        if not candidates:
+            messagebox.showinfo(APP_TITLE, '선택한 사이트는 이미 후속 작업 완료 상태입니다.')
+            return
+        if not messagebox.askyesno(APP_TITLE,
+                f'선택한 {len(candidates)}개 사이트에서 소유확인, 수집 주기, robots.txt, 사이트맵 제출, 페이지 요청을 직접 완료했습니까?\n\n'
+                '네이버에 요청을 보내거나 성공 여부를 검증하지 않고, 프로그램에 완료 (수동)로 기록합니다.'):
+            return
+        now = time.strftime('%Y-%m-%d %H:%M:%S')
+        for project in candidates:
+            project.ownership = '완료'
+            for field in ('frequency', 'robots', 'sitemap', 'crawl'):
+                if not getattr(project, field).startswith('완료'):
+                    setattr(project, field, '완료 (수동)')
+            project.crawl_completed_at = now
+            project.updated_at = now
+            project.last_error = ''
+            self._status(f'{project.name}: 네이버 후속 작업 완료 (수동 확인)')
         self._save()
         self._refresh_table()
 
