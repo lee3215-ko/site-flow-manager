@@ -9,7 +9,7 @@ from naver_browser import NAVER_DASHBOARD, NaverAutomationError, NaverBrowser, N
 
 
 class LoginBrowserTests(unittest.TestCase):
-    def test_each_site_uses_fresh_document_and_session_storage_but_same_login_context(self):
+    def test_fresh_document_is_used_only_to_recover_stale_session_storage(self):
         sites = ['https://first.pages.dev', 'https://second.pages.dev', 'https://third.pages.dev']
         original = self.helper.page
         self.context.add_cookies([{'name': 'test_login', 'value': 'shared', 'url': NAVER_DASHBOARD}])
@@ -21,7 +21,7 @@ class LoginBrowserTests(unittest.TestCase):
             const cached = sessionStorage.getItem('selectedSite') || site;
             sessionStorage.setItem('selectedSite', cached);
             history.pushState({}, '', '/console/site/summary?site=' + encodeURIComponent(site));
-            document.body.innerHTML = '<div>' + cached + '</div><div role="list"><a href="/console/site/option?site=' + encodeURIComponent(cached) + '">settings 設定</a></div>';
+            document.body.innerHTML = '<a href="/console/board">Board</a><div>' + cached + '</div><div role="list"><a href="/console/site/option?site=' + encodeURIComponent(cached) + '">settings 設定</a></div>';
           }
         </script>'''
         self.context.route(NAVER_DASHBOARD, lambda route: route.fulfill(content_type='text/html', body=body))
@@ -31,8 +31,8 @@ class LoginBrowserTests(unittest.TestCase):
             self.assertEqual(self.helper.page.evaluate('sessionStorage.getItem("selectedSite")'), site)
             self.assertIn('test_login=shared', self.helper.page.evaluate('document.cookie'))
             self.assertFalse(original.is_closed())
-            self.assertEqual(len(self.context.pages), 2)
-            if previous:
+            self.assertEqual(len(self.context.pages), 1 if site == sites[0] else 2)
+            if previous and previous != original:
                 self.assertTrue(previous.is_closed())
             previous = self.helper.page
 
@@ -57,7 +57,7 @@ class LoginBrowserTests(unittest.TestCase):
             counts[site] += 1
             menu_site = 'https://previous.pages.dev' if counts[site] == 1 else site
             href = self.helper._settings_url(menu_site)
-            route.fulfill(content_type='text/html', body=f'<meta charset="utf-8"><div role="list"><a href="{href}">settings 設定</a></div>')
+            route.fulfill(content_type='text/html', body=f'<meta charset="utf-8"><a href="/console/board">Board</a><div role="list"><a href="{href}">settings 設定</a></div>')
         self.context.route('**/console/site/summary*', summary)
         for site in sites:
             self.helper._open_site(site)
@@ -109,6 +109,7 @@ class LoginBrowserTests(unittest.TestCase):
                 old.replaceWith(replacement);
               },300);
             };</script>'''))
+        self.helper.page.goto(target)
         self.helper.set_fast_frequency(site)
         self.assertTrue(self.helper.page.locator('input').is_checked())
         self.assertEqual(self.helper.page.evaluate('window.clicks'), 1)
@@ -124,6 +125,7 @@ class LoginBrowserTests(unittest.TestCase):
             <script>document.querySelector('label').onclick=()=>{
               document.querySelector('[role=alert]').hidden=false;
             };</script>'''))
+        self.helper.page.goto(self.helper._settings_url(site))
         with self.assertRaisesRegex(NaverAutomationError, '저장 실패'):
             self.helper.set_fast_frequency(site)
 
@@ -154,7 +156,7 @@ class LoginBrowserTests(unittest.TestCase):
         fetch('/api-board/list/current');
         function openSite(site) {
           history.pushState({}, '', '/console/site/summary?site=' + encodeURIComponent(site));
-          document.body.innerHTML = '<h1>요약</h1><a href="/console/setting/alarm">도구 설정</a><div role="list"><a id="settings"><i>settings</i> 설정</a></div>';
+          document.body.innerHTML = '<a href="/console/board">Board</a><h1>요약</h1><a href="/console/setting/alarm">도구 설정</a><div role="list"><a id="settings"><i>settings</i> 설정</a></div>';
           document.getElementById('settings').onclick = () => {
             history.pushState({}, '', '/console/site/option?site=' + encodeURIComponent(site));
             document.body.innerHTML += '<input type="radio" value="fast" checked>';
@@ -174,6 +176,20 @@ class LoginBrowserTests(unittest.TestCase):
         current = self.helper.page.url
         self.helper._open_site(sites[1])
         self.assertEqual(self.helper.page.url, current)
+        self.assertEqual(len(self.context.pages), 1)
+
+    def test_missing_menu_does_not_directly_navigate_or_reload(self):
+        self.helper.page.goto(NAVER_DASHBOARD)
+        before = self.helper.page.url
+        with self.assertRaisesRegex(NaverSessionError, '주소 직접 이동 없이'):
+            self.helper._goto_tolerating_login_redirect(self.helper._settings_url('https://example.pages.dev'))
+        self.assertEqual(self.helper.page.url, before)
+
+    def test_closed_tab_is_replaced_before_starting_site_work(self):
+        self.helper.page.close()
+        replacement = self.helper.select_live_page()
+        self.assertFalse(replacement.is_closed())
+        self.assertEqual(len(self.context.pages), 1)
 
     def test_settings_menu_for_other_site_is_not_ready(self):
         self.helper.page.goto(self.helper._site_console_url('summary', 'https://other.pages.dev'))

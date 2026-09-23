@@ -104,7 +104,6 @@ class NaverBrowser:
             "--no-default-browser-check",
             "--new-window",
             "--disable-background-mode",
-            "--disable-blink-features=AutomationControlled",
         ]
         if self.headless:
             arguments.append("--headless=new")
@@ -307,7 +306,11 @@ class NaverBrowser:
                 self.status(f'네이버 내부 링크로 이동: {target.path}')
                 link.click()
                 return
-        self.status(f'네이버 페이지 열기: {target.hostname}{target.path}')
+        if url != NAVER_DASHBOARD or self._is_login_page(self.page):
+            raise NaverSessionError('화면의 이동 링크를 찾지 못했습니다. 주소 직접 이동 없이 중단합니다. 열린 화면에서 해당 메뉴를 확인해 주세요.')
+        if current.hostname == 'searchadvisor.naver.com' and current.path.startswith('/console/'):
+            raise NaverSessionError('사이트 목록 링크를 찾지 못했습니다. 주소 직접 이동 없이 중단합니다. 열린 창에서 목록보기를 눌러 주세요.')
+        self.status(f'네이버 초기 접속: {target.hostname}{target.path}')
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         except PlaywrightError as exc:
@@ -564,18 +567,10 @@ class NaverBrowser:
         return None
 
     def _open_site(self, site_url: str) -> None:
-        assert self.page
+        self.select_live_page()
         if self._site_management_ready(site_url):
             self.status(f'이미 열린 사이트 관리 화면 확인: {site_url}')
             return
-        previous_work = self._work_page
-        self.page = self.context.new_page()
-        self._work_page = self.page
-        self.board_payload = None
-        self.status(f'사이트별 새 작업 탭 준비 (로그인 세션 유지): {site_url}')
-        self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
-        if previous_work and not previous_work.is_closed():
-            previous_work.close()
         self._wait_dashboard(require_input=False)
         self._click_registered_site(site_url)
         deadline = time.monotonic() + 60
@@ -598,16 +593,24 @@ class NaverBrowser:
             if self._site_management_ready(site_url):
                 self.status(f'사이트 관리 화면 확인: {site_url}')
                 return
-            stale_site = self._stale_menu_site(site_url)
+            stale_site = self._stale_menu_site(site_url) or self._conflicting_site_heading(site_url)
             if stale_site:
                 if stale_since is None:
                     stale_since = time.monotonic()
                 elif time.monotonic() - stale_since >= 1:
                     if menu_reloaded:
                         self._save_navigation_diagnostic(site_url)
-                        raise NaverSessionError('새로고침 후에도 이전 사이트 메뉴가 남아 있습니다. 다른 사이트에 요청하지 않고 일괄 작업을 중단합니다.')
-                    self.status(f'이전 사이트 메뉴 감지: {stale_site} → {site_url}. 현재 화면을 한 번 새로고침합니다.')
-                    self.page.reload(wait_until='domcontentloaded', timeout=60_000)
+                        raise NaverSessionError('복구 후에도 이전 사이트 메뉴가 남아 있습니다. 다른 사이트에 요청하지 않고 일괄 작업을 중단합니다.')
+                    self.status(f'이전 사이트 화면 상태 감지: {stale_site} → {site_url}. 새 작업 탭에서 한 번만 복구합니다.')
+                    previous_work = self._work_page
+                    self.page = self.context.new_page()
+                    self._work_page = self.page
+                    self.board_payload = None
+                    self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
+                    if previous_work and not previous_work.is_closed():
+                        previous_work.close()
+                    self._wait_dashboard(require_input=False)
+                    self._click_registered_site(site_url)
                     menu_reloaded = True
                     stale_since = None
                     deadline = time.monotonic() + 60

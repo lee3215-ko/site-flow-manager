@@ -655,13 +655,16 @@ class PublisherApp(tk.Tk):
                     self.naver_browser.browser_process is not None
                     and self.naver_browser.browser_process.poll() is None
                 )
-                if process_alive and self.naver_browser.browser.is_connected():
+                has_pages = any(not p.is_closed() for p in self.naver_browser.context.pages)
+                if process_alive and self.naver_browser.browser.is_connected() and has_pages:
                     self.naver_browser.select_live_page()
                     return self.naver_browser
             except Exception:
                 pass
             try:
-                self.naver_browser.__exit__(None, None, None)
+                self._status('닫힌 네이버 브라우저를 다시 준비합니다. 저장된 로그인 상태는 유지합니다.')
+                self.naver_browser._close_browser(save_state=False)
+                self.naver_browser.playwright.stop()
             except Exception:
                 pass
             self.naver_browser = None
@@ -1337,6 +1340,7 @@ class PublisherApp(tk.Tk):
                                 project, f"{project.name} {labels[field_name]}: {state}"
                             )
 
+                        browser = self._get_naver_browser()
                         count = browser.run_after_ownership(
                             project.url,
                             manifest.get("pages", []),
