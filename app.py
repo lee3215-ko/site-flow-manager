@@ -16,7 +16,9 @@ import tkinter as tk
 from tkinter import ttk
 
 from cloudflare_client import CloudflareAccountPool, CloudflareClient
-from naver_browser import NaverBrowser, automation_self_test, settings_page_self_test, session_failure
+from admin_sync import AdminSync
+from admin_server.embedded import LocalAdmin
+from naver_browser import NaverBrowser, NaverSessionError, automation_self_test, settings_page_self_test, session_failure
 from naver_tools import check_public_files, load_manifest, verify_public_deployment
 from secret_store import load_secret, save_secret
 from version import APP_VERSION
@@ -83,6 +85,8 @@ class PublisherApp(tk.Tk):
         self.configure(bg=self.COLORS["bg"])
         self.projects = self._load_projects()
         self.settings = self._load_settings()
+        self.admin_sync = AdminSync(APP_DIR)
+        self.local_admin = LocalAdmin(APP_DIR.parent / 'SiteFlowAdmin')
         self.cloudflare_statuses: list[dict] = []
         self.naver_site_count: tuple[int, int] | None = None
         self.naver_count_error = ""
@@ -99,6 +103,7 @@ class PublisherApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(700, self.refresh_service_counts)
         self.after(3000, lambda: self.check_updates(manual=False))
+        self.after(30000, self._sync_tick)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -109,6 +114,12 @@ class PublisherApp(tk.Tk):
         style.configure("TProgressbar", troughcolor="#E5EAF1", background=self.COLORS["primary"], borderwidth=0)
 
     def _build_ui(self) -> None:
+        menu = tk.Menu(self)
+        admin_menu = tk.Menu(menu, tearoff=False)
+        admin_menu.add_command(label='관리자 웹사이트 열기', command=self.open_admin_website)
+        admin_menu.add_command(label='외부 서버 연결 (고급)', command=self.open_admin_settings)
+        menu.add_cascade(label='관리자', menu=admin_menu)
+        self.config(menu=menu)
         nav = tk.Frame(self, bg=self.COLORS["nav"], width=230)
         nav.pack(side="left", fill="y")
         nav.pack_propagate(False)
@@ -118,6 +129,7 @@ class PublisherApp(tk.Tk):
         self._nav_button(nav, "ZIP 여러 개 추가", self.add_zips)
         self._nav_button(nav, "선택 사이트 SEO 재배포", self.redeploy_seo)
         self._nav_button(nav, "Cloudflare 설정", self.open_settings)
+        self._nav_button(nav, "관리자 웹사이트 열기", self.open_admin_website)
         self._nav_button(nav, "네이버 로그인 저장", self.open_naver_login)
         self._nav_button(nav, "네이버 아이디 입력 / 수정", self.edit_naver_account)
         self._nav_button(nav, "연결 현황 새로고침", self.refresh_service_counts)
@@ -197,7 +209,7 @@ class PublisherApp(tk.Tk):
         self.date_filter = ttk.Combobox(filters, textvariable=self.completion_filter, state='readonly', width=35)
         self.date_filter.pack(side='left')
         self.date_filter.bind('<<ComboboxSelected>>', lambda event: self._refresh_table())
-        self.visible_count = tk.Label(filters, bg=self.COLORS['bg'])
+        self.visible_count = tk.Label(filters, bg=self.COLORS['bg'], fg=self.COLORS['primary'], font=('Malgun Gothic', 9, 'bold'))
         self.visible_count.pack(side='left', padx=12)
         self._button(filters, '2단계 수동 완료 표시', self.mark_post_complete).pack(side='right', padx=7)
         self.deploy_only_var = tk.BooleanVar(value=False)
@@ -206,13 +218,15 @@ class PublisherApp(tk.Tk):
         table_panel = tk.Frame(content, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"])
         table_panel.pack(fill="both", expand=True)
         columns = ("name", "url", "pages", "registration", "cloudflare", "cloudflare_account", "ownership", "naver_account", "frequency", "robots", "sitemap", "crawl")
-        columns = ("name", "title") + columns[1:]
+        columns = ("row_number", "name", "title") + columns[1:]
         self.tree = ttk.Treeview(table_panel, columns=columns, show="headings", selectmode="extended")
         self.tree.heading('#0', text='완료일별 그룹')
         self.tree.column('#0', width=245, minwidth=160, stretch=False)
         self.tree.tag_configure('completed_group', background='#E8EFF9', foreground='#17375E')
         headings = {"name": "ZIP/프로젝트", "url": "인식한 사이트 주소", "pages": "페이지", "registration": "네이버 등록", "cloudflare": "배포", "cloudflare_account": "CF 계정", "ownership": "소유확인", "naver_account": "네이버 아이디", "frequency": "수집 주기", "robots": "ROBOTS", "sitemap": "사이트맵", "crawl": "페이지 요청"}
         widths = {"name": 125, "url": 190, "pages": 45, "registration": 78, "cloudflare": 72, "cloudflare_account": 82, "ownership": 72, "naver_account": 110, "frequency": 82, "robots": 68, "sitemap": 68, "crawl": 82}
+        headings['row_number'] = '번호'
+        widths['row_number'] = 55
         for column in columns:
             if column == "title":
                 headings[column] = "사이트 타이틀"
@@ -231,6 +245,7 @@ class PublisherApp(tk.Tk):
         self.tree.bind("<Double-1>", self._table_double_click)
         self.tree.bind("<Control-c>", self.copy_selected_urls)
         self.tree.bind("<Delete>", lambda _event: self.delete_selected_projects())
+        self.tree.bind('<<TreeviewSelect>>', self._update_selection_count)
 
         log_panel = tk.Frame(log_tab, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"])
         log_panel.pack(fill="both", expand=True, padx=12, pady=12)
@@ -358,6 +373,82 @@ class PublisherApp(tk.Tk):
             if account.get("account_id") and account.get("api_token")
         }
         save_secret(TOKEN_FILE, json.dumps(token_map, ensure_ascii=False))
+        if hasattr(self, 'admin_sync'):
+            try:
+                self.admin_sync.enqueue([asdict(item) for item in self.projects], accounts, APP_VERSION)
+            except Exception:
+                self.admin_sync.status = '중앙 기록 저장 실패: 디스크 공간 및 권한 확인 필요'
+
+    def _sync_tick(self):
+        if not self.closing:
+            self.admin_sync.flush()
+            self.after(30000, self._sync_tick)
+
+    def open_admin_website(self):
+        if self.busy or self.closing:
+            messagebox.showinfo('관리자 웹사이트', '현재 작업이 끝난 후 열어 주세요.')
+            return
+        password = None
+        if self.local_admin.needs_setup:
+            password = simpledialog.askstring('관리자 비밀번호 만들기',
+                '처음 한 번만 설정합니다.\n관리자 로그인에 사용할 비밀번호를 입력하세요 (14자 이상).', show='*', parent=self)
+            if password is None:
+                return
+            if len(password) < 14:
+                messagebox.showerror('비밀번호 확인', '14자 이상으로 입력해 주세요.')
+                return
+            repeat = simpledialog.askstring('비밀번호 확인', '같은 비밀번호를 한 번 더 입력하세요.', show='*', parent=self)
+            if repeat != password:
+                messagebox.showerror('비밀번호 확인', '비밀번호가 일치하지 않습니다.')
+                return
+        local_connected = (self.admin_sync.config.get('enabled') and
+                           self.admin_sync.config.get('url') == self.local_admin.url)
+        if not local_connected and not messagebox.askyesno('이 컴퓨터 기록 연결',
+                '이 컴퓨터의 작업 기록과 Cloudflare 토큰을 로컬 관리자에 연결할까요?\n'
+                '인터넷에 공개되지 않으며 토큰은 암호화 보관합니다.\n'
+                '기존 외부 서버 연동이 있으면 로컬 연동으로 변경됩니다.', parent=self):
+            return
+
+        def start():
+            config = self.local_admin.start(password)
+            self.admin_sync.configure(self.local_admin.url, config['DEVICE_KEY'],
+                                      os.environ.get('COMPUTERNAME', '내 컴퓨터'))
+
+        def ready(_result):
+            self._save()
+            webbrowser.open(self.local_admin.url)
+            self._append_log('관리자 웹사이트를 열었습니다. 설정한 비밀번호로 로그인하세요.')
+
+        self._background('관리자 웹사이트를 준비하는 중...', start, ready)
+
+    def open_admin_settings(self):
+        window = tk.Toplevel(self)
+        window.title('중앙 관리자 연동')
+        window.geometry('620x410')
+        tk.Label(window, text='작업 상태·네이버 아이디·Cloudflare API 토큰을 지정 서버로 전송합니다.\n본인 소유 서버만 연결하세요. 비밀번호·쿠키·원본 로그는 보내지 않습니다.',
+                 justify='left', wraplength=570).pack(padx=20, pady=15)
+        entries = {}
+        for key, label in [('url', '관리 서버 주소'), ('name', '이 컴퓨터 이름'), ('key', '기기 연결 키')]:
+            tk.Label(window, text=label).pack(anchor='w', padx=20)
+            entry = tk.Entry(window, width=70, show='*' if key == 'key' else '')
+            entry.insert(0, self.admin_sync.config.get(key, ''))
+            entry.pack(padx=20, pady=5)
+            entries[key] = entry
+        tk.Label(window, text=self.admin_sync.status).pack(pady=8)
+
+        def connect():
+            if not messagebox.askyesno('기록·토큰 전송 확인', '기존 작업 목록과 Cloudflare API 토큰을 이 서버에 전송할까요?', parent=window):
+                return
+            try:
+                self.admin_sync.configure(*(entries[k].get().strip() for k in ('url', 'key', 'name')))
+                self._save()
+                messagebox.showinfo('중앙 연동', '전송을 시작했습니다. 실패한 기록은 암호화 보관 후 재시도합니다.', parent=window)
+                window.destroy()
+            except Exception as exc:
+                messagebox.showerror('설정 확인', str(exc), parent=window)
+
+        ttk.Button(window, text='동의하고 연결 / 동기화', command=connect).pack(pady=5)
+        ttk.Button(window, text='연동 끄기', command=lambda: (self.admin_sync.disable(), window.destroy())).pack()
 
     def _append_log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -428,19 +519,24 @@ class PublisherApp(tk.Tk):
                 for value in (project.name, project.url, project.naver_account, project.title)
             ):
                 continue
-            self._insert_project_row(project, '')
             count += 1
-        self.visible_count.configure(text=f'{count}개 표시 / 전체 {len(self.projects)}개')
+            self._insert_project_row(project, '', count)
         for item in selected:
             if self.tree.exists(item):
                 self.tree.selection_add(item)
         if (mode, query) == getattr(self, '_table_query', None) and position:
             self.tree.yview_moveto(position[0])
         self._table_query = (mode, query)
+        self._update_selection_count()
         self._update_summary()
 
-    def _insert_project_row(self, project, parent):
-        self.tree.insert(parent, 'end', iid=project.name, values=(project.name, project.title or '제목 없음', project.url, project.pages, project.registration, project.cloudflare, project.cloudflare_account, project.ownership, project.naver_account, project.frequency, project.robots, project.sitemap, project.crawl))
+    def _update_selection_count(self, _event=None):
+        visible = set(self.tree.get_children())
+        selected = visible.intersection(self.tree.selection())
+        self.visible_count.configure(text=f'선택 {len(selected)}개 / 표시 {len(visible)}개 / 전체 {len(self.projects)}개')
+
+    def _insert_project_row(self, project, parent, row_number):
+        self.tree.insert(parent, 'end', iid=project.name, values=(row_number, project.name, project.title or '제목 없음', project.url, project.pages, project.registration, project.cloudflare, project.cloudflare_account, project.ownership, project.naver_account, project.frequency, project.robots, project.sitemap, project.crawl))
 
     def _update_summary(self) -> None:
         if not hasattr(self, "card_values"):
@@ -650,21 +746,29 @@ class PublisherApp(tk.Tk):
 
     def _get_naver_browser(self) -> NaverBrowser:
         if self.naver_browser:
+            existing = self.naver_browser
             try:
-                process_alive = (
-                    self.naver_browser.browser_process is not None
-                    and self.naver_browser.browser_process.poll() is None
-                )
-                has_pages = any(not p.is_closed() for p in self.naver_browser.context.pages)
-                if process_alive and self.naver_browser.browser.is_connected() and has_pages:
-                    self.naver_browser.select_live_page()
-                    return self.naver_browser
+                connected = existing.browser.is_connected()
+            except Exception as exc:
+                raise NaverSessionError('네이버 연결 상태를 확인하지 못했습니다. 로그인 창을 보존하고 작업을 중단합니다. 다시 시도해 주세요.') from exc
+            if connected:
+                try:
+                    # A launcher PID or a transient empty tab list is not proof
+                    # that the connected Chromium browser has exited.
+                    existing.select_live_page()
+                    return existing
+                except Exception as exc:
+                    raise NaverSessionError('네이버 작업 탭을 확인하지 못했습니다. 로그인 창을 닫지 않았습니다. 창이 준비된 후 다시 시도해 주세요.') from exc
+            try:
+                process_exited = existing.browser_process is not None and existing.browser_process.poll() is not None
             except Exception:
-                pass
+                process_exited = False
+            if not process_exited:
+                raise NaverSessionError('네이버 자동화 연결이 끊겼지만 브라우저 종료는 확인되지 않았습니다. 로그인 창은 보존했습니다. 프로그램을 다시 시작하기 전에 현재 작업 상태를 확인해 주세요.')
             try:
-                self._status('닫힌 네이버 브라우저를 다시 준비합니다. 저장된 로그인 상태는 유지합니다.')
-                self.naver_browser._close_browser(save_state=False)
-                self.naver_browser.playwright.stop()
+                self._status('종료가 확인된 네이버 브라우저를 다시 준비합니다. 저장된 로그인 상태는 유지합니다.')
+                existing._close_browser(save_state=False)
+                existing.playwright.stop()
             except Exception:
                 pass
             self.naver_browser = None
@@ -694,6 +798,7 @@ class PublisherApp(tk.Tk):
 
         def wait_for_close():
             if future.done():
+                self.local_admin.close()
                 self.worker.shutdown(wait=False, cancel_futures=True)
                 self.destroy()
             else:

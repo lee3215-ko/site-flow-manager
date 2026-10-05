@@ -1,15 +1,18 @@
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 from app import PublisherApp
+from naver_browser import NaverBrowser, NaverSessionError
+from playwright.sync_api import sync_playwright
 
 
 class BrowserRecoveryTests(unittest.TestCase):
-    def test_all_closed_tabs_recreates_browser_without_overwriting_saved_state(self):
+    def test_confirmed_exit_recreates_browser_without_overwriting_saved_state(self):
         app = Mock()
         app.settings = {'last_naver_account': 'saved-account'}
         old = app.naver_browser
-        old.browser_process.poll.return_value = None
-        old.browser.is_connected.return_value = True
+        old.browser_process.poll.return_value = 0
+        old.browser.is_connected.return_value = False
         old.context.pages = []
         new = MagicMock()
         with patch('app.NaverBrowser', return_value=new):
@@ -28,3 +31,69 @@ class BrowserRecoveryTests(unittest.TestCase):
         browser.context.pages = [page]
         self.assertIs(PublisherApp._get_naver_browser(app), browser)
         browser._close_browser.assert_not_called()
+
+    def test_empty_tabs_do_not_close_connected_browser(self):
+        app = Mock()
+        old = app.naver_browser
+        old.browser.is_connected.return_value = True
+        old.context.pages = []
+        self.assertIs(PublisherApp._get_naver_browser(app), old)
+        old.select_live_page.assert_called_once()
+        old._close_browser.assert_not_called()
+
+    def test_launcher_exit_does_not_override_live_connection(self):
+        app = Mock()
+        old = app.naver_browser
+        old.browser.is_connected.return_value = True
+        old.browser_process.poll.return_value = 0
+        self.assertIs(PublisherApp._get_naver_browser(app), old)
+        old._close_browser.assert_not_called()
+
+    def test_tab_selection_error_preserves_login_window(self):
+        app = Mock()
+        old = app.naver_browser
+        old.browser.is_connected.return_value = True
+        old.select_live_page.side_effect = RuntimeError('temporary navigation')
+        with self.assertRaises(NaverSessionError):
+            PublisherApp._get_naver_browser(app)
+        old._close_browser.assert_not_called()
+        old.playwright.stop.assert_not_called()
+
+    def test_disconnect_does_not_terminate_live_process(self):
+        app = Mock()
+        old = app.naver_browser
+        old.browser.is_connected.return_value = False
+        old.browser_process.poll.return_value = None
+        with self.assertRaises(NaverSessionError):
+            PublisherApp._get_naver_browser(app)
+        old._close_browser.assert_not_called()
+        self.assertIs(app.naver_browser, old)
+
+    def test_two_stages_keep_actual_chromium_page_and_document(self):
+        # Synthetic page only: no Naver login, cookies or remote requests.
+        with sync_playwright() as playwright:
+            chromium = playwright.chromium.launch(headless=True)
+            try:
+                context = chromium.new_context()
+                page = context.new_page()
+                page.set_content('<p id="state">stage-one-session</p>')
+                browser = NaverBrowser(Path('.'))
+                browser.browser = chromium
+                browser.context = context
+                browser.page = page
+                browser.browser_process = Mock()
+                browser.browser_process.poll.return_value = 0
+                app = Mock()
+                app.naver_browser = browser
+                with patch.object(browser, '_close_browser') as close:
+                    self.assertIs(PublisherApp._get_naver_browser(app), browser)
+                    self.assertIs(PublisherApp._get_naver_browser(app), browser)
+                    self.assertEqual(page.locator('#state').inner_text(), 'stage-one-session')
+                    self.assertFalse(page.is_closed())
+                    close.assert_not_called()
+                page.close()
+                self.assertIs(PublisherApp._get_naver_browser(app), browser)
+                self.assertFalse(browser.page.is_closed())
+                self.assertIs(browser.context, context)
+            finally:
+                chromium.close()

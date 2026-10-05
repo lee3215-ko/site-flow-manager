@@ -20,6 +20,8 @@ def fingerprint():
     paths = list(ROOT.glob('*.py')) + list(ROOT.glob('requirements*.txt'))
     paths += [ROOT / 'SiteFlow.spec', ROOT / 'README.md']
     paths += list((ROOT / 'scripts').glob('*.py')) + list((ROOT / 'tests').glob('test_*.py'))
+    paths += [p for p in (ROOT / 'admin_server').rglob('*')
+              if p.is_file() and p.suffix in {'.py', '.html', '.txt'}]
     digest = hashlib.sha256()
     for path in sorted(paths):
         digest.update(path.relative_to(ROOT).as_posix().encode())

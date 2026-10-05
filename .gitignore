@@ -25,3 +25,17 @@
 !/.github/
 !/.github/workflows/
 !/.github/workflows/release.yml
+admin-data/
+!/admin_sync.py
+!/admin-start.bat
+!/admin-connection-key.bat
+!/admin_server/
+!/admin_server/server.py
+!/admin_server/local.py
+!/admin_server/embedded.py
+!/admin_server/requirements.txt
+!/admin_server/README.md
+!/admin_server/사용안내.md
+!/admin_server/templates/
+!/admin_server/templates/index.html
+!/scripts/admin_smoke.py

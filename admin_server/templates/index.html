@@ -1,0 +1,28 @@
+<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>SiteFlow 관리자</title><style>
+body{margin:0;background:#f3f6fb;color:#172033;font:15px system-ui}main{max-width:1200px;margin:40px auto;padding:24px}section{background:white;border:1px solid #dce3ec;border-radius:14px;padding:24px;margin:20px 0}h1{color:#17375e}input,select,button{padding:10px;margin:5px;border:1px solid #ccd5e0;border-radius:6px}button{background:#2563eb;color:white;cursor:pointer}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px;border-bottom:1px solid #eee;word-break:break-all}.scroll{overflow:auto;max-height:550px}#message{white-space:pre-wrap}small{color:#667085}</style>
+<main><h1>SITE FLOW · 통합 관리</h1><small>본인 소유 기기의 작업 상태와 Cloudflare 계정을 관리합니다.</small>
+<section id="login"><h2>관리자 로그인</h2><input id="password" type="password" placeholder="관리자 비밀번호"><button id="loginButton">로그인</button></section>
+<p id="message" role="status"></p><div id="panel" hidden>
+<button id="refresh">새로고침</button><button id="logout">로그아웃</button>
+<section><h2>연결 기기</h2><div id="devices"></div></section>
+<section><h2>작업 이력</h2><input id="search" placeholder="사이트·상태 검색"><button id="prev">이전 50건</button><button id="next">다음 50건</button><span id="page"></span><div class="scroll"><table><thead><tr><th>수신 일시 / 기기</th><th>사이트</th><th>배포</th><th>소유확인</th><th>페이지 요청</th></tr></thead><tbody id="records"></tbody></table></div></section>
+<section><h2>Cloudflare 계정</h2><select id="account"></select><input id="reauth" type="password" placeholder="토큰 조회용 비밀번호 재입력"><button id="reveal">토큰 보기</button><input id="token" type="password" readonly aria-label="API 토큰"><button id="copy">복사</button><button id="hide">숨기기</button></section>
+<section><h2>기존 사이트 수정 재배포</h2><p>위에서 계정을 선택하고 정확한 프로젝트명을 입력하세요. ZIP 전체로 기존 배포가 교체됩니다. 기존 소유확인 HTML도 ZIP에 포함해야 합니다.</p><input id="project" placeholder="Cloudflare 프로젝트명"><input id="zip" type="file" accept=".zip"><button id="deploy">수정 ZIP 재배포</button><p><small>최대 ZIP 100MB. HTML·sitemap·robots 주소를 실제 배포주소로 보정합니다. ZIP 원본은 서버에 영구 보관하지 않습니다.</small></p></section>
+<section><h2>관리자 활동</h2><div id="audit"></div></section></div></main>
+<script>
+let csrf='',page=0,state={records:[]},timer;
+const el=id=>document.getElementById(id), msg=t=>el('message').textContent=t;
+async function api(path, options={}) {const r=await fetch('/api/'+path,{...options,headers:{'X-CSRF-Token':csrf,...options.headers}});if(!r.ok)throw Error('요청 실패 ('+r.status+'). 로그인·설정·파일을 확인하세요.');return r.json();}
+function json(body){return {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};}
+function clearToken(){el('token').value='';el('token').type='password';clearTimeout(timer);}
+function draw(){el('records').replaceChildren();const query=el('search').value.toLowerCase();for(const record of state.records){for(const p of JSON.parse(record.payload)){if(!JSON.stringify(p).toLowerCase().includes(query))continue;const tr=document.createElement('tr');for(const text of [new Date(record.at*1000).toLocaleString()+' / '+record.device,p.url+' '+(p.title||''),p.cloudflare,p.ownership,p.crawl]){const td=document.createElement('td');td.textContent=text||'';tr.append(td);}el('records').append(tr);}}el('page').textContent=(page+1)+' 페이지';}
+async function refresh(){state=await api('state?page='+page);el('devices').textContent=state.devices.map(d=>d.name+' · v'+d.version+' · '+new Date(d.seen*1000).toLocaleString()).join(' | ');const selected=el('account').value;el('account').replaceChildren();for(const a of state.accounts){const o=document.createElement('option');o.value=a.id;o.textContent=a.name+' ('+a.id+')';el('account').append(o);}if(selected)el('account').value=selected;el('audit').textContent=state.audit.map(a=>new Date(a.at*1000).toLocaleString()+' '+a.action+' '+a.target+' '+a.result).join(' / ');draw();}
+function handle(id,fn){el(id).onclick=async()=>{try{await fn();}catch(e){msg(e.message);}};}
+handle('loginButton',async()=>{const password=el('password').value;el('password').value='';const result=await api('login',json({password}));csrf=result.csrf;el('login').hidden=true;el('panel').hidden=false;await refresh();msg('로그인 완료');});
+handle('logout',async()=>{await api('logout',json({}));clearToken();location.reload();});handle('refresh',refresh);
+handle('prev',async()=>{page=Math.max(0,page-1);await refresh();});handle('next',async()=>{page++;await refresh();});el('search').oninput=draw;
+handle('reveal',async()=>{const password=el('reauth').value;el('reauth').value='';const r=await api('token',json({account:el('account').value,password}));el('token').value=r.token;el('token').type='text';clearTimeout(timer);timer=setTimeout(clearToken,30000);msg('토큰은 30초 후 숨겨집니다.');});
+handle('copy',async()=>{if(el('token').value)await navigator.clipboard.writeText(el('token').value);});handle('hide',clearToken);el('account').onchange=clearToken;
+handle('deploy',async()=>{if(!el('zip').files[0])throw Error('ZIP 파일을 선택하세요.');if(!confirm(el('account').selectedOptions[0].textContent+' / '+el('project').value+' 프로젝트를 교체 배포합니까?'))return;const form=new FormData();form.set('account',el('account').value);form.set('project',el('project').value);form.set('zip',el('zip').files[0]);el('deploy').disabled=true;msg('배포 중입니다. 완료될 때까지 기다려 주세요.');try{const r=await api('redeploy',{method:'POST',body:form});msg('배포 완료: '+r.url);await refresh();}finally{el('deploy').disabled=false;}});
+</script></html>
