@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
@@ -61,6 +62,7 @@ class NaverBrowser:
         self._pending_login_account = ''
         self._account_input_page = None
         self._saving_state = False
+        self._cdp_endpoint = None
 
     def _chromium_path(self) -> Path:
         app_dir = (
@@ -103,6 +105,7 @@ class NaverBrowser:
             "--no-default-browser-check",
             "--new-window",
             "--disable-background-mode",
+            "--window-size=1440,920",
         ]
         if self.headless:
             arguments.append("--headless=new")
@@ -133,19 +136,9 @@ class NaverBrowser:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.playwright = sync_playwright().start()
         try:
-            endpoint = self._launch_browser()
-            self.browser = self.playwright.chromium.connect_over_cdp(endpoint)
-            context_options = {
-                "accept_downloads": True,
-                "viewport": {"width": 1440, "height": 920},
-            }
-            if self.state_file.is_file():
-                context_options["storage_state"] = str(self.state_file)
-            try:
-                self.context = self.browser.new_context(**context_options)
-            except Exception:
-                context_options.pop("storage_state", None)
-                self.context = self.browser.new_context(**context_options)
+            self._cdp_endpoint = self._launch_browser()
+            self._connect_browser()
+            self._restore_saved_state()
         except Exception as exc:
             self._close_browser(save_state=False)
             self.playwright.stop()
@@ -153,19 +146,81 @@ class NaverBrowser:
                 "자동화 Chromium을 열 수 없습니다.\n"
                 f"실제 원인: {exc}"
             ) from exc
+        return self
+
+    def _connect_browser(self, previous_url: str | None = None) -> None:
+        self.browser = self.playwright.chromium.connect_over_cdp(self._cdp_endpoint)
+        # new_context() creates an incognito CDP context with disposeOnDetach.
+        # Only the launcher's default context survives an automation disconnect.
+        self.context = self.browser.contexts[0]
         self.context.on("response", self._capture_board_response)
         self._install_account_capture()
-        self.page = self.context.new_page()
-        for browser_context in self.browser.contexts:
-            if browser_context == self.context:
-                continue
-            for blank_page in browser_context.pages:
+        self.page = next((page for page in reversed(self.context.pages)
+                          if previous_url and page.url == previous_url), None)
+        self.select_live_page()
+        self.page.set_viewport_size({"width": 1440, "height": 920})
+
+    def _restore_saved_state(self) -> None:
+        if not self.state_file.is_file():
+            return
+        try:
+            state = json.loads(self.state_file.read_text(encoding='utf-8'))
+            self.context.add_cookies(state.get('cookies', []))
+            origins = {origin['origin']: origin.get('localStorage', [])
+                       for origin in state.get('origins', [])}
+            # Restore once per origin/tab, never resurrect old state after logout.
+            marker = '__siteflow_restore_' + uuid.uuid4().hex
+            self.context.add_init_script('''((origins, marker) => {
+              const entries = origins[location.origin];
+              if (!entries || sessionStorage.getItem(marker)) return;
+              for (const item of entries) {
+                if (localStorage.getItem(item.name) === null)
+                  localStorage.setItem(item.name, item.value);
+              }
+              sessionStorage.setItem(marker, '1');
+            })(''' + json.dumps(origins) + ', ' + json.dumps(marker) + ');')
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, PlaywrightError):
+            self.status('저장된 네이버 로그인 상태를 복원하지 못했습니다. 열린 창에서 로그인해 주세요.')
+
+    def connection_is_alive(self) -> bool:
+        if not self.browser or not self.browser.is_connected():
+            return False
+        session = None
+        try:
+            # is_connected() alone can stay True after the driver has stopped.
+            session = self.browser.new_browser_cdp_session()
+            session.send('Browser.getVersion')
+            return True
+        except PlaywrightError as exc:
+            if session_failure(exc):
+                return False
+            raise
+        finally:
+            if session:
                 try:
-                    if blank_page.url == 'about:blank':
-                        blank_page.close()
+                    session.detach()
                 except PlaywrightError:
                     pass
-        return self
+
+    def reconnect(self) -> None:
+        if not self._cdp_endpoint:
+            raise NaverSessionError('기존 네이버 브라우저 연결 주소가 없습니다.')
+        previous_url = self.page.url if self.page else None
+        captured_on_current_page = self._account_input_page == self.page
+        # Disconnect the driver, not the externally launched browser/window.
+        if self.playwright:
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+        self.playwright = sync_playwright().start()
+        try:
+            self._connect_browser(previous_url)
+            if captured_on_current_page:
+                self._account_input_page = self.page
+            self.board_payload = None
+        except Exception as exc:
+            raise NaverSessionError('열린 네이버 창에 자동화 연결을 다시 붙이지 못했습니다. 창을 닫지 않고 작업을 중단합니다.') from exc
 
     def _capture_login_account(self, source, value) -> None:
         if self._saving_state:
@@ -184,12 +239,13 @@ class NaverBrowser:
         self._account_input_page = page
 
     def _install_account_capture(self) -> None:
-        self.context.expose_binding('siteflowAccountInput', self._capture_login_account)
-        self.context.add_init_script('''(() => {
+        binding = 'siteflowAccountInput_' + uuid.uuid4().hex
+        self.context.expose_binding(binding, self._capture_login_account)
+        script = '''(() => {
           if (location.hostname !== 'nid.naver.com' || window !== window.top) return;
           const report = () => {
             const field = document.querySelector('input#id:not([type="password"])');
-            window.siteflowAccountInput(field ? field.value : '').catch(() => {});
+            window[BINDING](field ? field.value : '').catch(() => {});
           };
           report();
           document.addEventListener('DOMContentLoaded', report, {once: true});
@@ -199,7 +255,16 @@ class NaverBrowser:
             }, true);
           }
           document.addEventListener('submit', report, true);
-        })();''')
+        })();'''.replace('BINDING', json.dumps(binding))
+        self.context.add_init_script(script)
+        for page in self.context.pages:
+            if urlsplit(page.url).hostname == 'nid.naver.com':
+                try:
+                    page.evaluate(script)
+                except PlaywrightError:
+                    # A login redirect may replace the document; the init script
+                    # will capture the account in the next document instead.
+                    pass
 
     def _save_authenticated_state(self) -> None:
         # Playwright may create temporary origin pages while reading local storage.

@@ -12,7 +12,7 @@ class BrowserRecoveryTests(unittest.TestCase):
         app.settings = {'last_naver_account': 'saved-account'}
         old = app.naver_browser
         old.browser_process.poll.return_value = 0
-        old.browser.is_connected.return_value = False
+        old.connection_is_alive.return_value = False
         old.context.pages = []
         new = MagicMock()
         with patch('app.NaverBrowser', return_value=new):
@@ -25,7 +25,7 @@ class BrowserRecoveryTests(unittest.TestCase):
         app = Mock()
         browser = app.naver_browser
         browser.browser_process.poll.return_value = None
-        browser.browser.is_connected.return_value = True
+        browser.connection_is_alive.return_value = True
         page = Mock()
         page.is_closed.return_value = False
         browser.context.pages = [page]
@@ -35,7 +35,7 @@ class BrowserRecoveryTests(unittest.TestCase):
     def test_empty_tabs_do_not_close_connected_browser(self):
         app = Mock()
         old = app.naver_browser
-        old.browser.is_connected.return_value = True
+        old.connection_is_alive.return_value = True
         old.context.pages = []
         self.assertIs(PublisherApp._get_naver_browser(app), old)
         old.select_live_page.assert_called_once()
@@ -44,7 +44,7 @@ class BrowserRecoveryTests(unittest.TestCase):
     def test_launcher_exit_does_not_override_live_connection(self):
         app = Mock()
         old = app.naver_browser
-        old.browser.is_connected.return_value = True
+        old.connection_is_alive.return_value = True
         old.browser_process.poll.return_value = 0
         self.assertIs(PublisherApp._get_naver_browser(app), old)
         old._close_browser.assert_not_called()
@@ -52,18 +52,29 @@ class BrowserRecoveryTests(unittest.TestCase):
     def test_tab_selection_error_preserves_login_window(self):
         app = Mock()
         old = app.naver_browser
-        old.browser.is_connected.return_value = True
+        old.connection_is_alive.return_value = True
         old.select_live_page.side_effect = RuntimeError('temporary navigation')
         with self.assertRaises(NaverSessionError):
             PublisherApp._get_naver_browser(app)
         old._close_browser.assert_not_called()
         old.playwright.stop.assert_not_called()
 
-    def test_disconnect_does_not_terminate_live_process(self):
+    def test_disconnect_reconnects_without_terminating_live_process(self):
         app = Mock()
         old = app.naver_browser
-        old.browser.is_connected.return_value = False
+        old.connection_is_alive.return_value = False
         old.browser_process.poll.return_value = None
+        self.assertIs(PublisherApp._get_naver_browser(app), old)
+        old.reconnect.assert_called_once()
+        old._close_browser.assert_not_called()
+        self.assertIs(app.naver_browser, old)
+
+    def test_reconnect_failure_preserves_live_process_and_helper(self):
+        app = Mock()
+        old = app.naver_browser
+        old.connection_is_alive.return_value = False
+        old.browser_process.poll.return_value = None
+        old.reconnect.side_effect = NaverSessionError('connection unavailable')
         with self.assertRaises(NaverSessionError):
             PublisherApp._get_naver_browser(app)
         old._close_browser.assert_not_called()

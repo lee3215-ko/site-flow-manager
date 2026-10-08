@@ -748,7 +748,7 @@ class PublisherApp(tk.Tk):
         if self.naver_browser:
             existing = self.naver_browser
             try:
-                connected = existing.browser.is_connected()
+                connected = existing.connection_is_alive()
             except Exception as exc:
                 raise NaverSessionError('네이버 연결 상태를 확인하지 못했습니다. 로그인 창을 보존하고 작업을 중단합니다. 다시 시도해 주세요.') from exc
             if connected:
@@ -764,7 +764,9 @@ class PublisherApp(tk.Tk):
             except Exception:
                 process_exited = False
             if not process_exited:
-                raise NaverSessionError('네이버 자동화 연결이 끊겼지만 브라우저 종료는 확인되지 않았습니다. 로그인 창은 보존했습니다. 프로그램을 다시 시작하기 전에 현재 작업 상태를 확인해 주세요.')
+                self._status('열린 네이버 창에 자동화 연결을 다시 붙입니다. 로그인 창은 닫지 않습니다.')
+                existing.reconnect()
+                return existing
             try:
                 self._status('종료가 확인된 네이버 브라우저를 다시 준비합니다. 저장된 로그인 상태는 유지합니다.')
                 existing._close_browser(save_state=False)
