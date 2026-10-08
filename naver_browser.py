@@ -61,7 +61,6 @@ class NaverBrowser:
         self._pending_login_account = ''
         self._account_input_page = None
         self._saving_state = False
-        self._work_page = None
 
     def _chromium_path(self) -> Path:
         app_dir = (
@@ -162,7 +161,8 @@ class NaverBrowser:
                 continue
             for blank_page in browser_context.pages:
                 try:
-                    blank_page.close()
+                    if blank_page.url == 'about:blank':
+                        blank_page.close()
                 except PlaywrightError:
                     pass
         return self
@@ -601,14 +601,12 @@ class NaverBrowser:
                     if menu_reloaded:
                         self._save_navigation_diagnostic(site_url)
                         raise NaverSessionError('복구 후에도 이전 사이트 메뉴가 남아 있습니다. 다른 사이트에 요청하지 않고 일괄 작업을 중단합니다.')
-                    self.status(f'이전 사이트 화면 상태 감지: {stale_site} → {site_url}. 새 작업 탭에서 한 번만 복구합니다.')
-                    previous_work = self._work_page
+                    self.status(f'이전 사이트 화면 상태 감지: {stale_site} → {site_url}. 기존 창·탭은 유지하고 새 작업 탭에서 한 번만 복구합니다.')
+                    # A former work tab may now be used for manual ownership
+                    # verification. Keep it open even when recovery needs a new tab.
                     self.page = self.context.new_page()
-                    self._work_page = self.page
                     self.board_payload = None
                     self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
-                    if previous_work and not previous_work.is_closed():
-                        previous_work.close()
                     self._wait_dashboard(require_input=False)
                     self._click_registered_site(site_url)
                     menu_reloaded = True

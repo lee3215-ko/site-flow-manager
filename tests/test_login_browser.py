@@ -31,9 +31,9 @@ class LoginBrowserTests(unittest.TestCase):
             self.assertEqual(self.helper.page.evaluate('sessionStorage.getItem("selectedSite")'), site)
             self.assertIn('test_login=shared', self.helper.page.evaluate('document.cookie'))
             self.assertFalse(original.is_closed())
-            self.assertEqual(len(self.context.pages), 1 if site == sites[0] else 2)
+            self.assertEqual(len(self.context.pages), sites.index(site) + 1)
             if previous and previous != original:
-                self.assertTrue(previous.is_closed())
+                self.assertFalse(previous.is_closed())
             previous = self.helper.page
 
     def test_matching_url_and_menu_with_wrong_body_blocks_radio_change(self):
