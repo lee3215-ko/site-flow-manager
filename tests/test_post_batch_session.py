@@ -46,7 +46,11 @@ class PostBatchSessionTests(unittest.TestCase):
         self.assertEqual(browser.run_after_ownership.call_count, 1)
         self.assertEqual(projects[1].last_error, '')
 
+    def test_plain_driver_eof_stops_before_next_site_without_replaying_requests(self):
+        browser, projects = self.run_batch(Exception('Connection closed while reading from the driver'))
+        self.assertEqual(browser.run_after_ownership.call_count, 1)
+        self.assertEqual(projects[1].last_error, '')
+
     def test_cancel_during_public_check_does_not_start_browser_work(self):
         browser, projects = self.run_batch(cancel_during_check=True)
         browser.run_after_ownership.assert_not_called()
-

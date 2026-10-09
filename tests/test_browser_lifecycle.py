@@ -17,6 +17,31 @@ ORIGIN = 'https://siteflow.test'
 
 
 class BrowserWorkerLifecycleTests(unittest.TestCase):
+    def test_unexpected_driver_exit_between_tasks_recovers_same_window_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                def stage_one():
+                    helper = NaverBrowser(Path(directory), headless=True)
+                    helper.__enter__()
+                    helper.page.set_content('<p id="manual">ownership-completed</p>')
+                    return helper
+                helper = worker.submit(stage_one).result(timeout=30)
+                try:
+                    app = Mock()
+                    app.naver_browser = helper
+                    browser_pid = helper.browser_process.pid
+                    for _ in range(2):
+                        def stop_test_driver():
+                            helper.playwright._impl_obj._connection._transport._proc.kill()
+                        worker.submit(stop_test_driver).result(timeout=10)
+                        time.sleep(0.1)
+                        self.assertIs(worker.submit(PublisherApp._get_naver_browser, app).result(timeout=20), helper)
+                        self.assertEqual(worker.submit(lambda: helper.page.locator('#manual').inner_text()).result(timeout=10), 'ownership-completed')
+                        self.assertEqual(helper.browser_process.pid, browser_pid)
+                        self.assertIsNone(helper.browser_process.poll())
+                finally:
+                    worker.submit(helper.__exit__, None, None, None).result(timeout=30)
+
     def test_separate_stage_tasks_reuse_worker_and_manual_document(self):
         with tempfile.TemporaryDirectory() as directory:
             with ThreadPoolExecutor(max_workers=1) as worker:
@@ -120,6 +145,29 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertEqual(diagnostic['stage'], 'health-check')
         self.assertIn('Protocol error', diagnostic['error'])
         self.assertEqual(diagnostic['owner_thread'], diagnostic['current_thread'])
+
+    def test_unexpected_driver_exit_recovers_selected_page_without_navigation(self):
+        helper = self.helper
+        helper.page.evaluate("window.manualOwnership = 'completed'; sessionStorage.setItem('site', 'selected')")
+        helper.context.add_cookies([{'name': 'synthetic_login', 'value': 'logged-in', 'url': ORIGIN}])
+        browser_pid = helper.browser_process.pid
+        selected_url = helper.page.url
+        # Terminate only this test's automation driver, not Chromium or a user process.
+        driver = helper.playwright._impl_obj._connection._transport._proc
+        driver.kill()
+        app = Mock()
+        app.naver_browser = helper
+        with patch.object(helper, 'reconnect', wraps=helper.reconnect) as reconnect:
+            self.assertIs(PublisherApp._get_naver_browser(app), helper)
+            reconnect.assert_called_once()
+        self.assertEqual(helper.browser_process.pid, browser_pid)
+        self.assertIsNone(helper.browser_process.poll())
+        self.assertEqual(helper.page.url, selected_url)
+        self.assertEqual(helper.page.evaluate('window.manualOwnership'), 'completed')
+        self.assertEqual(helper.page.evaluate("sessionStorage.getItem('site')"), 'selected')
+        self.assertEqual(helper.context.cookies(ORIGIN)[0]['value'], 'logged-in')
+        self.assertEqual(len(helper.context.pages), 1)
+        self.download_html('naver-synthetic-after-driver-exit.html')
 
     def test_connection_error_diagnostic_redacts_authentication_values(self):
         error = RuntimeError('failed https://searchadvisor.naver.com/auth/callback?code=secret-one&state=secret-two token=secret-three cookie=secret-four')

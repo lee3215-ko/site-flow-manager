@@ -37,10 +37,14 @@ class NaverAutomationError(RuntimeError):
 class NaverSessionError(NaverAutomationError):
     """Authentication or browser failure: stop the batch, not just one site."""
 
+def driver_connection_closed(error: Exception) -> bool:
+    # Playwright's pipe transport raises plain Exception for an unexpected EOF.
+    return 'connection closed while reading from the driver' in str(error).lower()
+
 def session_failure(error):
     return isinstance(error, NaverSessionError) or (
         isinstance(error, PlaywrightError) and 'closed' in str(error).lower()
-    )
+    ) or driver_connection_closed(error)
 
 
 class NaverBrowser:
@@ -204,6 +208,8 @@ class NaverBrowser:
             return False
         except Exception as exc:
             self._save_connection_diagnostic('health-check', exc)
+            if driver_connection_closed(exc):
+                return False
             raise
         finally:
             if session:

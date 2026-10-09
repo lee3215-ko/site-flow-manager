@@ -2,11 +2,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 from app import PublisherApp
-from naver_browser import NaverBrowser, NaverSessionError
+from naver_browser import NaverBrowser, NaverSessionError, session_failure
 from playwright.sync_api import sync_playwright
 
 
 class BrowserRecoveryTests(unittest.TestCase):
+    def test_plain_driver_eof_is_a_session_failure(self):
+        self.assertTrue(session_failure(Exception('Browser.new_browser_cdp_session: Connection closed while reading from the driver')))
+        self.assertFalse(session_failure(RuntimeError('unexpected application error')))
+
+    def test_unknown_probe_error_is_not_silently_reconnected(self):
+        helper = NaverBrowser(Path('.'))
+        helper.browser = Mock()
+        helper.browser.new_browser_cdp_session.side_effect = RuntimeError('unexpected application error')
+        helper._save_connection_diagnostic = Mock()
+        helper.reconnect = Mock()
+        app = Mock()
+        app.naver_browser = helper
+        with self.assertRaisesRegex(NaverSessionError, 'unexpected application error'):
+            PublisherApp._get_naver_browser(app)
+        helper.reconnect.assert_not_called()
+        self.assertIs(app.naver_browser, helper)
+
     def test_probe_cleanup_error_does_not_discard_successful_connection(self):
         helper = NaverBrowser(Path('.'))
         helper.browser = Mock()
