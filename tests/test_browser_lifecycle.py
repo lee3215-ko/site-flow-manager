@@ -1,15 +1,43 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 import urllib.request
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
+from playwright.sync_api import Error as PlaywrightError
 
 from app import PublisherApp
 from naver_browser import NaverBrowser, NaverSessionError
 
 
-ORIGIN = 'http://siteflow.test'
+ORIGIN = 'https://siteflow.test'
+
+
+class BrowserWorkerLifecycleTests(unittest.TestCase):
+    def test_separate_stage_tasks_reuse_worker_and_manual_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                def stage_one():
+                    helper = NaverBrowser(Path(directory), headless=True)
+                    helper.__enter__()
+                    helper.page.set_content('<p id="manual">ownership-completed</p>')
+                    return helper
+                helper = worker.submit(stage_one).result(timeout=30)
+                try:
+                    app = Mock()
+                    app.naver_browser = helper
+                    helper.login_account = 'synthetic-manual-account'
+                    for _ in range(3):
+                        time.sleep(0.2)
+                        self.assertIs(worker.submit(PublisherApp._get_naver_browser, app).result(timeout=20), helper)
+                        self.assertEqual(worker.submit(lambda: helper.page.locator('#manual').inner_text()).result(timeout=10), 'ownership-completed')
+                        self.assertEqual(worker.submit(threading.get_ident).result(timeout=10), helper._owner_thread)
+                    self.assertEqual(helper.login_account, 'synthetic-manual-account')
+                finally:
+                    worker.submit(helper.__exit__, None, None, None).result(timeout=30)
 
 
 class BrowserLifecycleTests(unittest.TestCase):
@@ -24,7 +52,7 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertIs(self.helper.context, self.helper.browser.contexts[0])
         self.helper.context.route(ORIGIN + '/**', lambda route: route.fulfill(
             body='<p id="state">ownership-completed</p>', content_type='text/html'))
-        self.helper.page.goto(ORIGIN + '/verification')
+        self.helper.page.goto(ORIGIN + '/verification', wait_until='domcontentloaded')
 
     def download_html(self, filename):
         self.helper.page.evaluate('''name => {
@@ -76,6 +104,29 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertIsNone(helper.browser_process.poll())
         helper.reconnect()
         self.assertEqual(helper.page.locator('#state').inner_text(), 'ownership-completed')
+
+    def test_protocol_probe_error_reconnects_once_without_navigation(self):
+        helper = self.helper
+        app = Mock()
+        app.naver_browser = helper
+        with patch.object(helper.browser, 'new_browser_cdp_session', side_effect=PlaywrightError(
+                'Protocol error (Target.attachToBrowserTarget): No session with given id')):
+            with patch.object(helper, 'reconnect', wraps=helper.reconnect) as reconnect:
+                self.assertIs(PublisherApp._get_naver_browser(app), helper)
+                reconnect.assert_called_once()
+        self.assertEqual(helper.page.locator('#state').inner_text(), 'ownership-completed')
+        self.assertEqual(len(helper.context.pages), 1)
+        diagnostic = json.loads((helper.profile_dir / 'diagnostics/connection-latest.json').read_text(encoding='utf-8'))
+        self.assertEqual(diagnostic['stage'], 'health-check')
+        self.assertIn('Protocol error', diagnostic['error'])
+        self.assertEqual(diagnostic['owner_thread'], diagnostic['current_thread'])
+
+    def test_connection_error_diagnostic_redacts_authentication_values(self):
+        error = RuntimeError('failed https://searchadvisor.naver.com/auth/callback?code=secret-one&state=secret-two token=secret-three cookie=secret-four')
+        self.helper._save_connection_diagnostic('synthetic', error)
+        raw = (self.helper.profile_dir / 'diagnostics/connection-latest.json').read_text(encoding='utf-8')
+        for secret in ('secret-one', 'secret-two', 'secret-three', 'secret-four'):
+            self.assertNotIn(secret, raw)
 
     def test_saved_state_restores_without_reapplying_after_logout(self):
         helper = self.helper

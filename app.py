@@ -750,7 +750,7 @@ class PublisherApp(tk.Tk):
             try:
                 connected = existing.connection_is_alive()
             except Exception as exc:
-                raise NaverSessionError('네이버 연결 상태를 확인하지 못했습니다. 로그인 창을 보존하고 작업을 중단합니다. 다시 시도해 주세요.') from exc
+                raise NaverSessionError('네이버 연결 상태를 확인하지 못했습니다. 로그인 창을 보존하고 작업을 중단합니다.\n실제 원인: ' + existing.connection_error_details(exc)) from exc
             if connected:
                 try:
                     # A launcher PID or a transient empty tab list is not proof

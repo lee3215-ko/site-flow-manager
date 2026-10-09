@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -9,6 +10,59 @@ from naver_browser import NAVER_DASHBOARD, NaverAutomationError, NaverBrowser, N
 
 
 class LoginBrowserTests(unittest.TestCase):
+    def test_stage_two_waits_on_selected_summary_without_board_navigation(self):
+        site = 'https://example.pages.dev'
+        target = self.helper._site_console_url('summary', site)
+        self.helper.page.goto(target)
+        href = json.dumps(self.helper._settings_url(site))
+        self.helper.page.set_content(f'''<div>{site}</div><div role="list"></div><script>
+            window.manualOwnership = 'completed';
+            setTimeout(() => {{ const a = document.createElement('a');
+              a.href = {href}; a.textContent = 'Settings';
+              document.querySelector('[role=list]').append(a); }}, 300);
+            </script>''')
+        with patch.object(self.helper, '_wait_dashboard') as dashboard:
+            self.helper._open_site(site)
+            dashboard.assert_not_called()
+        self.assertEqual(self.helper.page.url, target)
+        self.assertEqual(self.helper.page.evaluate('window.manualOwnership'), 'completed')
+
+    def test_login_on_ready_summary_does_not_require_board_response_or_navigation(self):
+        site = 'https://example.pages.dev'
+        target = self.helper._site_console_url('summary', site)
+        self.helper.page.goto(target)
+        self.helper.page.set_content(f'<div>{site}</div><div role="list"><a href="{self.helper._settings_url(site)}">Settings</a></div>')
+        self.helper.page.evaluate("window.manualOwnership = 'completed'")
+        with patch.object(self.helper, '_goto_tolerating_login_redirect') as navigate:
+            self.helper.wait_for_login()
+            navigate.assert_not_called()
+        self.assertEqual(self.helper.page.url, target)
+        self.assertEqual(self.helper.page.evaluate('window.manualOwnership'), 'completed')
+        self.assertTrue(self.helper.state_file.is_file())
+
+    def test_login_waits_for_summary_menu_without_returning_to_board(self):
+        site = 'https://example.pages.dev'
+        target = self.helper._site_console_url('summary', site)
+        self.helper.page.goto(target)
+        href = json.dumps(self.helper._settings_url(site))
+        self.helper.page.set_content(f'''<div>{site}</div><div role="list"></div><script>
+            setTimeout(() => {{ const a = document.createElement('a');
+              a.href = {href}; a.textContent = 'Settings';
+              document.querySelector('[role=list]').append(a); }}, 300);
+            </script>''')
+        with patch.object(self.helper, '_goto_tolerating_login_redirect') as navigate:
+            self.helper._wait_dashboard(timeout_seconds=3, require_input=False, allow_site_management=True)
+            navigate.assert_not_called()
+        self.assertEqual(self.helper.page.url, target)
+
+    def test_visible_registration_field_is_login_evidence_without_new_list_response(self):
+        self.context.route(NAVER_DASHBOARD, lambda route: route.fulfill(
+            content_type='text/html', body='<input maxlength="253" type="text">'))
+        self.helper.page.goto(NAVER_DASHBOARD)
+        self.assertIsNone(self.helper.board_payload)
+        self.helper._wait_dashboard(timeout_seconds=3, require_input=False)
+        self.assertTrue(self.helper.state_file.is_file())
+
     def test_fresh_document_is_used_only_to_recover_stale_session_storage(self):
         sites = ['https://first.pages.dev', 'https://second.pages.dev', 'https://third.pages.dev']
         original = self.helper.page

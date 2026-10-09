@@ -8,12 +8,16 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from importlib.metadata import version
+
+from version import APP_VERSION
 
 from playwright.sync_api import (
     Error as PlaywrightError,
@@ -63,6 +67,7 @@ class NaverBrowser:
         self._account_input_page = None
         self._saving_state = False
         self._cdp_endpoint = None
+        self._owner_thread = None
 
     def _chromium_path(self) -> Path:
         app_dir = (
@@ -134,6 +139,7 @@ class NaverBrowser:
 
     def __enter__(self):
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self._owner_thread = threading.get_ident()
         self.playwright = sync_playwright().start()
         try:
             self._cdp_endpoint = self._launch_browser()
@@ -149,7 +155,7 @@ class NaverBrowser:
         return self
 
     def _connect_browser(self, previous_url: str | None = None) -> None:
-        self.browser = self.playwright.chromium.connect_over_cdp(self._cdp_endpoint)
+        self.browser = self.playwright.chromium.connect_over_cdp(self._cdp_endpoint, timeout=10_000)
         # new_context() creates an incognito CDP context with disposeOnDetach.
         # Only the launcher's default context survives an automation disconnect.
         self.context = self.browser.contexts[0]
@@ -183,24 +189,59 @@ class NaverBrowser:
             self.status('저장된 네이버 로그인 상태를 복원하지 못했습니다. 열린 창에서 로그인해 주세요.')
 
     def connection_is_alive(self) -> bool:
-        if not self.browser or not self.browser.is_connected():
-            return False
         session = None
         try:
+            if not self.browser or not self.browser.is_connected():
+                return False
             # is_connected() alone can stay True after the driver has stopped.
             session = self.browser.new_browser_cdp_session()
             session.send('Browser.getVersion')
             return True
         except PlaywrightError as exc:
-            if session_failure(exc):
-                return False
+            self._save_connection_diagnostic('health-check', exc)
+            # A failed probe is not proof that the login window has closed.
+            # Let the app reconnect once to the still-running browser.
+            return False
+        except Exception as exc:
+            self._save_connection_diagnostic('health-check', exc)
             raise
         finally:
             if session:
                 try:
                     session.detach()
-                except PlaywrightError:
-                    pass
+                except Exception as exc:
+                    self._save_connection_diagnostic('health-check-cleanup', exc)
+
+    @staticmethod
+    def connection_error_details(error: Exception) -> str:
+        message = str(error).splitlines()[0] if str(error) else ''
+        message = re.sub(r'https?://[^\s\"\'<>]+', '[URL omitted]', message)
+        message = re.sub(
+            r'(?i)\b(password|token|authorization|cookie|NID_AUT|NID_SES|code|state)(\s*[:=]\s*)\S+',
+            r'\1\2[redacted]', message,
+        )
+        return f'{type(error).__name__}: {message[:300]}'
+
+    def _save_connection_diagnostic(self, stage: str, error: Exception) -> None:
+        try:
+            path = self.profile_dir / 'diagnostics' / 'connection-latest.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                location = urlsplit(self.page.url) if self.page else None
+            except Exception:
+                location = None
+            data = {
+                'app_version': APP_VERSION, 'playwright_version': version('playwright'),
+                'stage': stage, 'error': self.connection_error_details(error),
+                'captured_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'owner_thread': self._owner_thread, 'current_thread': threading.get_ident(),
+                'process_exit_code': self.browser_process.poll() if self.browser_process else None,
+                'location': {'host': location.hostname, 'path': location.path} if location else None,
+            }
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            self.status(f'네이버 연결 진단: {data["error"]} (기록: {path})')
+        except Exception:
+            pass
 
     def reconnect(self) -> None:
         if not self._cdp_endpoint:
@@ -213,14 +254,15 @@ class NaverBrowser:
                 self.playwright.stop()
             except Exception:
                 pass
-        self.playwright = sync_playwright().start()
         try:
+            self.playwright = sync_playwright().start()
             self._connect_browser(previous_url)
             if captured_on_current_page:
                 self._account_input_page = self.page
             self.board_payload = None
         except Exception as exc:
-            raise NaverSessionError('열린 네이버 창에 자동화 연결을 다시 붙이지 못했습니다. 창을 닫지 않고 작업을 중단합니다.') from exc
+            self._save_connection_diagnostic('reconnect', exc)
+            raise NaverSessionError('열린 네이버 창에 자동화 연결을 다시 붙이지 못했습니다. 창을 닫지 않고 작업을 중단합니다.\n실제 원인: ' + self.connection_error_details(exc)) from exc
 
     def _capture_login_account(self, source, value) -> None:
         if self._saving_state:
@@ -436,19 +478,23 @@ class NaverBrowser:
             if cookie["name"] in {"NID_AUT", "NID_SES"}
         ))
 
-    def _wait_dashboard(self, timeout_seconds: int = 600, require_input: bool = True):
+    def _wait_dashboard(self, timeout_seconds: int = 600, require_input: bool = True,
+                        allow_site_management: bool = False):
         self.select_live_page()
         # Keep the current dashboard response when no document navigation is needed.
         current = urlsplit(self.page.url)
         if current.hostname != 'searchadvisor.naver.com' or current.path.rstrip('/') != '/console/board':
             self.board_payload = None
         waiting_login = self._is_login_page(self.page)
-        if not waiting_login:
+        current_site = parse_qs(current.query).get('site', [''])[0]
+        waiting_management = allow_site_management and self._at_site(current_site)
+        if not waiting_login and not waiting_management:
             self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
         deadline = time.monotonic() + timeout_seconds
         login_notified = False
         callback_started = None
         navigated_locations = set()
+        management_started = None
         while time.monotonic() < deadline:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise NaverSessionError("네이버 로그인 대기를 중지했습니다.")
@@ -458,6 +504,20 @@ class NaverBrowser:
             self.select_live_page()
             on_login = self._is_login_page(self.page)
             url = urlsplit(self.page.url)
+            site = parse_qs(url.query).get('site', [''])[0]
+            if allow_site_management and not on_login and self._at_site(site):
+                if self._site_management_ready(site):
+                    self._save_authenticated_state()
+                    return None
+                if management_started is None:
+                    management_started = time.monotonic()
+                    self.status('이미 열린 네이버 사이트 관리 화면이 준비되는지 확인합니다. 목록으로 이동하지 않습니다.')
+                elif time.monotonic() - management_started >= 60:
+                    self._save_navigation_diagnostic(site)
+                    raise NaverSessionError('사이트 관리 화면이 60초 안에 준비되지 않았습니다. 열린 창을 유지하고 로그인 대기를 중단합니다.')
+                self.page.wait_for_timeout(250)
+                continue
+            management_started = None
             on_dashboard = url.hostname == 'searchadvisor.naver.com' and url.path.rstrip('/') == '/console/board'
             if url.hostname == 'searchadvisor.naver.com' and url.path.startswith('/auth/'):
                 if callback_started is None:
@@ -484,9 +544,9 @@ class NaverBrowser:
                 self._save_authenticated_state()
                 return None
             field = self._visible(self.page.locator('input[maxlength="253"][type="text"]')) if dashboard_ready else None
-            if require_input and field:
+            if field:
                 self._save_authenticated_state()
-                return field
+                return field if require_input else None
             if not login_notified:
                 self.status("네이버 로그인이 필요하면 열린 Chromium에서 로그인해 주세요. 최대 10분간 기다립니다.")
                 login_notified = True
@@ -542,7 +602,7 @@ class NaverBrowser:
 
     def wait_for_login(self) -> None:
         self.status("열린 Chromium에서 네이버 로그인을 완료해 주세요.")
-        self._wait_dashboard(require_input=False)
+        self._wait_dashboard(require_input=False, allow_site_management=True)
         self.status("네이버 로그인을 확인했습니다. 로그인 상태를 저장합니다.")
 
     def count_registered_sites(self) -> tuple[int, int]:
@@ -636,8 +696,11 @@ class NaverBrowser:
         if self._site_management_ready(site_url):
             self.status(f'이미 열린 사이트 관리 화면 확인: {site_url}')
             return
-        self._wait_dashboard(require_input=False)
-        self._click_registered_site(site_url)
+        if not self._at_site(site_url):
+            self._wait_dashboard(require_input=False)
+            self._click_registered_site(site_url)
+        else:
+            self.status(f'이미 선택된 사이트 관리 화면의 메뉴를 기다립니다. 목록으로 이동하지 않습니다: {site_url}')
         deadline = time.monotonic() + 60
         recovered = False
         menu_reloaded = False

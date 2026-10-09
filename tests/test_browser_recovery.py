@@ -7,6 +7,16 @@ from playwright.sync_api import sync_playwright
 
 
 class BrowserRecoveryTests(unittest.TestCase):
+    def test_probe_cleanup_error_does_not_discard_successful_connection(self):
+        helper = NaverBrowser(Path('.'))
+        helper.browser = Mock()
+        helper.browser.is_connected.return_value = True
+        session = helper.browser.new_browser_cdp_session.return_value
+        session.detach.side_effect = RuntimeError('temporary cleanup failure')
+        helper._save_connection_diagnostic = Mock()
+        self.assertTrue(helper.connection_is_alive())
+        helper._save_connection_diagnostic.assert_called_once()
+
     def test_confirmed_exit_recreates_browser_without_overwriting_saved_state(self):
         app = Mock()
         app.settings = {'last_naver_account': 'saved-account'}
