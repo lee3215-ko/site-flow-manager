@@ -174,9 +174,19 @@ class CloudflareAccountPool:
         self.current_index = 0
         self.full_accounts = set()
 
-    def refresh(self) -> list[dict]:
+    def refresh(self, recorded_counts: dict[str, int] | None = None) -> list[dict]:
+        # Recorded counts are for usage display only; deployment still needs project identities.
         statuses = []
         for index, (account, client) in enumerate(zip(self.accounts, self.clients)):
+            recorded = (recorded_counts or {}).get(account.get("account_id", ""))
+            if type(recorded) is int and recorded >= self.project_limit:
+                statuses.append({
+                    "name": account.get("name") or f"계정 {index + 1}",
+                    "account_id": account.get("account_id", ""),
+                    "count": recorded, "limit": self.project_limit,
+                    "error": "", "recorded": True,
+                })
+                continue
             try:
                 projects = client.list_projects(refresh=True)
                 self.projects[index] = projects

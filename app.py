@@ -306,6 +306,7 @@ class PublisherApp(tk.Tk):
     def _load_settings(self) -> dict:
         defaults = {
             "cloudflare_accounts": [],
+            "cloudflare_counts": {},
             "delay_min": 0,
             "delay_max": 0,
             "last_naver_account": "",
@@ -320,6 +321,12 @@ class PublisherApp(tk.Tk):
                         for key in ("delay_min", "delay_max", "last_naver_account")
                     }
                 )
+                counts = loaded.get("cloudflare_counts", {})
+                if isinstance(counts, dict):
+                    defaults["cloudflare_counts"] = {
+                        account_id: count for account_id, count in counts.items()
+                        if type(count) is int and count >= 0
+                    }
             except Exception:
                 pass
 
@@ -355,12 +362,18 @@ class PublisherApp(tk.Tk):
         return defaults
 
     def _save(self) -> None:
+        counts = self.settings.setdefault("cloudflare_counts", {})
+        for status in getattr(self, "cloudflare_statuses", []):
+            count = status.get("count")
+            if status.get("account_id") and type(count) is int and count >= 0 and not status.get("error"):
+                counts[status["account_id"]] = count
         DATA_FILE.write_text(json.dumps([asdict(item) for item in self.projects], ensure_ascii=False, indent=2), encoding="utf-8")
         accounts = self.settings.get("cloudflare_accounts") or []
         public_settings = {
             "delay_min": self.settings.get("delay_min", 0),
             "delay_max": self.settings.get("delay_max", 0),
             "last_naver_account": self.settings.get("last_naver_account", ""),
+            "cloudflare_counts": dict(counts),
             "cloudflare_accounts": [
                 {"name": account.get("name", ""), "account_id": account.get("account_id", "")}
                 for account in accounts
@@ -573,6 +586,9 @@ class PublisherApp(tk.Tk):
             capacity = sum(status["limit"] for status in known)
             failed = len(self.cloudflare_statuses) - len(known)
             suffix = f" · 오류 {failed}개" if failed else ""
+            recorded = sum(bool(status.get("recorded")) for status in known)
+            if recorded:
+                suffix += f" · 기록 {recorded}계정"
             self.connection_label.config(
                 text=f"● Cloudflare {account_count}계정 · Pages {used}/{capacity}{suffix}",
                 fg=self.COLORS["success"] if not failed else self.COLORS["warning"],
@@ -604,15 +620,17 @@ class PublisherApp(tk.Tk):
 
     def refresh_service_counts(self) -> None:
         accounts = self._cloudflare_accounts()
+        recorded_counts = dict(self.settings.get("cloudflare_counts", {}))
 
         def check():
             cloudflare_statuses = (
-                CloudflareAccountPool(accounts).refresh() if accounts else []
+                CloudflareAccountPool(accounts).refresh(recorded_counts=recorded_counts) if accounts else []
             )
             return cloudflare_statuses, self.naver_site_count, self.naver_count_error
 
         def done(result):
             self.cloudflare_statuses, self.naver_site_count, self.naver_count_error = result
+            self._save()
             self._update_service_labels()
             for status in self.cloudflare_statuses:
                 if status["count"] is None:
@@ -620,8 +638,9 @@ class PublisherApp(tk.Tk):
                         f"Cloudflare {status['name']} 확인 실패: {status['error']}"
                     )
                 else:
+                    suffix = " (기록 유지 · 조회 생략)" if status.get("recorded") else ""
                     self._append_log(
-                        f"Cloudflare {status['name']}: Pages {status['count']}/{status['limit']}"
+                        f"Cloudflare {status['name']}: Pages {status['count']}/{status['limit']}{suffix}"
                     )
             if self.naver_site_count:
                 self._append_log(
@@ -884,7 +903,8 @@ class PublisherApp(tk.Tk):
                 if status.get("account_id") == account_id:
                     if status.get("count") is None:
                         return "연결 오류"
-                    return f"{status['count']}/{status['limit']}"
+                    suffix = " · 기록" if status.get("recorded") else ""
+                    return f"{status['count']}/{status['limit']}{suffix}"
             return "확인 전"
 
         def refresh_list(select: int | None = None):
@@ -996,6 +1016,7 @@ class PublisherApp(tk.Tk):
                         "error": "",
                     }
                 )
+                self._save()
                 refresh_list(selected_index[0])
                 self._update_service_labels()
                 messagebox.showinfo(
