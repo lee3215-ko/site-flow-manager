@@ -728,21 +728,23 @@ class NaverBrowser:
                 self.status(f'사이트 관리 화면 확인: {site_url}')
                 return
             stale_site = self._stale_menu_site(site_url) or self._conflicting_site_heading(site_url)
-            if stale_site:
+            if stale_site and self._at_site(site_url):
                 if stale_since is None:
                     stale_since = time.monotonic()
-                elif time.monotonic() - stale_since >= 1:
+                elif time.monotonic() - stale_since >= 3:
                     if menu_reloaded:
                         self._save_navigation_diagnostic(site_url)
                         raise NaverSessionError('복구 후에도 이전 사이트 메뉴가 남아 있습니다. 다른 사이트에 요청하지 않고 일괄 작업을 중단합니다.')
-                    self.status(f'이전 사이트 화면 상태 감지: {stale_site} → {site_url}. 기존 창·탭은 유지하고 새 작업 탭에서 한 번만 복구합니다.')
-                    # A former work tab may now be used for manual ownership
-                    # verification. Keep it open even when recovery needs a new tab.
-                    self.page = self.context.new_page()
+                    self.status(f'이전 사이트 화면 상태 감지: {stale_site} → {site_url}. 현재 작업 탭을 한 번 새로고침합니다. 새 창은 만들지 않습니다.')
+                    # Reload the registered site's current document, without
+                    # creating tabs or clearing authentication/session storage.
                     self.board_payload = None
-                    self._goto_tolerating_login_redirect(NAVER_DASHBOARD)
-                    self._wait_dashboard(require_input=False)
-                    self._click_registered_site(site_url)
+                    try:
+                        self.page.reload(wait_until='domcontentloaded', timeout=30_000)
+                    except PlaywrightError as exc:
+                        message = str(exc).lower()
+                        if 'interrupted by another navigation' not in message and 'context was destroyed' not in message:
+                            raise NaverSessionError('현재 작업 탭 새로고침에 실패했습니다. 새 창을 만들지 않고 중단합니다.') from exc
                     menu_reloaded = True
                     stale_since = None
                     deadline = time.monotonic() + 60

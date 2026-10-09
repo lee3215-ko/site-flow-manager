@@ -63,7 +63,7 @@ class LoginBrowserTests(unittest.TestCase):
         self.helper._wait_dashboard(timeout_seconds=3, require_input=False)
         self.assertTrue(self.helper.state_file.is_file())
 
-    def test_fresh_document_is_used_only_to_recover_stale_session_storage(self):
+    def test_stale_site_recovery_reuses_one_tab_and_preserves_login_storage(self):
         sites = ['https://first.pages.dev', 'https://second.pages.dev', 'https://third.pages.dev']
         original = self.helper.page
         self.context.add_cookies([{'name': 'test_login', 'value': 'shared', 'url': NAVER_DASHBOARD}])
@@ -79,16 +79,61 @@ class LoginBrowserTests(unittest.TestCase):
           }
         </script>'''
         self.context.route(NAVER_DASHBOARD, lambda route: route.fulfill(content_type='text/html', body=body))
-        previous = None
+        from urllib.parse import parse_qs, urlsplit
+        def summary(route):
+            site = parse_qs(urlsplit(route.request.url).query)['site'][0]
+            route.fulfill(content_type='text/html', body=f'''<a href="/console/board">Board</a>
+                <div>{site}</div><div role="list"><a href="{self.helper._settings_url(site)}">Settings</a></div>
+                <script>sessionStorage.setItem('selectedSite', {json.dumps(site)})</script>''')
+        self.context.route('**/console/site/summary*', summary)
+        self.helper.page.goto(NAVER_DASHBOARD)
+        self.helper.page.evaluate("sessionStorage.setItem('syntheticAuth', 'keep'); localStorage.setItem('syntheticLogin', 'keep')")
         for site in sites:
             self.helper._open_site(site)
+            self.assertIs(self.helper.page, original)
             self.assertEqual(self.helper.page.evaluate('sessionStorage.getItem("selectedSite")'), site)
+            self.assertEqual(self.helper.page.evaluate("sessionStorage.getItem('syntheticAuth')"), 'keep')
+            self.assertEqual(self.helper.page.evaluate("localStorage.getItem('syntheticLogin')"), 'keep')
             self.assertIn('test_login=shared', self.helper.page.evaluate('document.cookie'))
             self.assertFalse(original.is_closed())
-            self.assertEqual(len(self.context.pages), sites.index(site) + 1)
-            if previous and previous != original:
-                self.assertFalse(previous.is_closed())
-            previous = self.helper.page
+            self.assertEqual(len(self.context.pages), 1)
+
+    def test_delayed_site_transition_does_not_create_tabs_or_reload(self):
+        site = 'https://example.pages.dev'
+        self.helper.page.goto(self.helper._site_console_url('summary', site))
+        href = self.helper._settings_url('https://previous.pages.dev')
+        correct = json.dumps(self.helper._settings_url(site))
+        self.helper.page.set_content(f'''<div role="list"><a href="{href}">Settings</a></div>
+            <script>setTimeout(() => document.querySelector('a').href = {correct}, 2200)</script>''')
+        with patch.object(self.context, 'new_page') as new_page, patch.object(self.helper.page, 'reload') as reload:
+            self.helper._open_site(site)
+            new_page.assert_not_called()
+            reload.assert_not_called()
+        self.assertEqual(len(self.context.pages), 1)
+
+    def test_work_tab_recovery_does_not_close_or_reload_manual_tab(self):
+        site = 'https://example.pages.dev'
+        target = self.helper._site_console_url('summary', site)
+        visits = []
+        def summary(route):
+            visits.append(route.request.url)
+            displayed = 'https://previous.pages.dev' if len(visits) == 1 else site
+            route.fulfill(content_type='text/html', body=f'<div>{displayed}</div><div role="list"><a href="{self.helper._settings_url(displayed)}">Settings</a></div>')
+        self.context.route(target, summary)
+        self.helper.page.goto(target)
+        manual = self.context.new_page()
+        manual.goto(NAVER_DASHBOARD)
+        manual.evaluate("window.manualVerification = 'keep'")
+        original = self.helper.page
+        with patch.object(self.context, 'new_page') as new_page:
+            self.helper._open_site(site)
+            new_page.assert_not_called()
+        self.assertIs(self.helper.page, original)
+        self.assertFalse(manual.is_closed())
+        self.assertEqual(manual.url, NAVER_DASHBOARD)
+        self.assertEqual(manual.evaluate('window.manualVerification'), 'keep')
+        self.assertEqual(len(self.context.pages), 2)
+        self.assertEqual(len(visits), 2)
 
     def test_matching_url_and_menu_with_wrong_body_blocks_radio_change(self):
         site = 'https://example.pages.dev'
@@ -113,11 +158,14 @@ class LoginBrowserTests(unittest.TestCase):
             href = self.helper._settings_url(menu_site)
             route.fulfill(content_type='text/html', body=f'<meta charset="utf-8"><a href="/console/board">Board</a><div role="list"><a href="{href}">settings 設定</a></div>')
         self.context.route('**/console/site/summary*', summary)
+        original = self.helper.page
         for site in sites:
             self.helper._open_site(site)
             self.assertEqual(counts[site], 2)
             self.assertTrue(self.helper._site_management_ready(site))
             self.assertIn('/console/site/summary?', self.helper.page.url)
+            self.assertIs(self.helper.page, original)
+            self.assertEqual(len(self.context.pages), 1)
 
     def test_persistently_stale_sidebar_stops_after_one_reload(self):
         site = 'https://example.pages.dev'
@@ -132,6 +180,7 @@ class LoginBrowserTests(unittest.TestCase):
         with self.assertRaisesRegex(NaverSessionError, '이전 사이트 메뉴'):
             self.helper._open_site(site)
         self.assertEqual(len(visits), 2)
+        self.assertEqual(len(self.context.pages), 1)
         self.assertTrue((Path(self.directory.name) / 'diagnostics/navigation-latest.json').is_file())
 
     def test_navigation_diagnostic_redacts_auth_queries_and_inputs(self):
