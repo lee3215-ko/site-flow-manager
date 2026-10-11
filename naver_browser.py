@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import re
@@ -151,7 +152,7 @@ class NaverBrowser:
             self._restore_saved_state()
         except Exception as exc:
             self._close_browser(save_state=False)
-            self.playwright.stop()
+            self._stop_playwright()
             raise NaverAutomationError(
                 "자동화 Chromium을 열 수 없습니다.\n"
                 f"실제 원인: {exc}"
@@ -218,6 +219,53 @@ class NaverBrowser:
                 except Exception as exc:
                     self._save_connection_diagnostic('health-check-cleanup', exc)
 
+    def _clear_stale_driver_loop(self, loop) -> None:
+        if loop is None or self._owner_thread != threading.get_ident():
+            return
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        # The sync SDK can retain a thread-local reference after its dispatcher
+        # exits. Only clear our own stopped loop, never a running/foreign loop.
+        if current is loop and not loop.is_running():
+            asyncio._set_running_loop(None)
+            self.status('종료된 네이버 자동화 루프 정보를 정리했습니다. 로그인 창은 유지합니다.')
+
+    def _stop_playwright(self) -> None:
+        if not self.playwright:
+            return
+        if self._owner_thread != threading.get_ident():
+            raise NaverSessionError('네이버 자동화 연결은 처음 실행한 작업 스레드에서만 정리할 수 있습니다.')
+        runtime = self.playwright
+        loop = runtime._impl_obj._loop
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is not None and current_loop is not loop:
+            raise NaverSessionError('다른 비동기 작업이 실행 중이어서 네이버 연결을 중복 실행하지 않았습니다. 로그인 창은 유지합니다.')
+        self._clear_stale_driver_loop(loop)
+        try:
+            runtime.stop()
+            if loop.is_running():
+                raise RuntimeError('Previous Playwright event loop is still running')
+            self._clear_stale_driver_loop(loop)
+            # stop() is a no-op after an interrupted SDK __exit__. Finish only
+            # the stopped loop's local cleanup before starting another driver.
+            if not loop.is_closed() and not loop.is_running():
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+        except Exception as exc:
+            self._save_connection_diagnostic('driver-stop', exc)
+            raise NaverSessionError('이전 네이버 자동화 연결을 정리하지 못했습니다. 새 연결을 중복 실행하지 않고 로그인 창을 보존합니다.\n실제 원인: ' + self.connection_error_details(exc)) from exc
+        self.playwright = None
+
     @staticmethod
     def connection_error_details(error: Exception) -> str:
         message = str(error).splitlines()[0] if str(error) else ''
@@ -244,22 +292,30 @@ class NaverBrowser:
                 'process_exit_code': self.browser_process.poll() if self.browser_process else None,
                 'location': {'host': location.hostname, 'path': location.path} if location else None,
             }
+            if self.playwright:
+                loop = self.playwright._impl_obj._loop
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+                data['driver_loop'] = {
+                    'closed': loop.is_closed(), 'running': loop.is_running(),
+                    'thread_reference_is_driver_loop': current_loop is loop,
+                }
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
             self.status(f'네이버 연결 진단: {data["error"]} (기록: {path})')
         except Exception:
             pass
 
     def reconnect(self) -> None:
+        if self._owner_thread != threading.get_ident():
+            raise NaverSessionError('네이버 재연결은 처음 실행한 작업 스레드에서만 진행할 수 있습니다.')
         if not self._cdp_endpoint:
             raise NaverSessionError('기존 네이버 브라우저 연결 주소가 없습니다.')
         previous_url = self.page.url if self.page else None
         captured_on_current_page = self._account_input_page == self.page
         # Disconnect the driver, not the externally launched browser/window.
-        if self.playwright:
-            try:
-                self.playwright.stop()
-            except Exception:
-                pass
+        self._stop_playwright()
         try:
             self.playwright = sync_playwright().start()
             self._connect_browser(previous_url)
@@ -356,8 +412,7 @@ class NaverBrowser:
 
     def __exit__(self, exc_type, exc, traceback):
         self._close_browser(save_state=True)
-        if self.playwright:
-            self.playwright.stop()
+        self._stop_playwright()
 
     def _visible(self, locator: Locator) -> Locator | None:
         try:

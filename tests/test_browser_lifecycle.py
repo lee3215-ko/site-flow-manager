@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import threading
@@ -168,6 +169,92 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertEqual(helper.context.cookies(ORIGIN)[0]['value'], 'logged-in')
         self.assertEqual(len(helper.context.pages), 1)
         self.download_html('naver-synthetic-after-driver-exit.html')
+
+    def test_repeated_probes_after_driver_exit_reconnect_without_nested_loop(self):
+        helper = self.helper
+        helper.page.evaluate("window.manualOwnership = 'completed'")
+        browser_pid = helper.browser_process.pid
+        helper.playwright._impl_obj._connection._transport._proc.kill()
+        self.assertFalse(helper.connection_is_alive())
+        self.assertFalse(helper.connection_is_alive())
+        helper.reconnect()
+        self.assertEqual(helper.browser_process.pid, browser_pid)
+        self.assertEqual(helper.page.evaluate('window.manualOwnership'), 'completed')
+        self.assertEqual(len(helper.context.pages), 1)
+
+    def test_stale_stopped_driver_loop_reference_does_not_block_reconnect(self):
+        helper = self.helper
+        helper.page.evaluate("window.manualOwnership = 'completed'")
+        browser_pid = helper.browser_process.pid
+        stopped_loop = helper.playwright._impl_obj._loop
+        with patch.object(stopped_loop, 'close'):
+            helper.playwright.stop()
+        # Model the thread-local loop reference retained after abnormal SDK teardown.
+        asyncio._set_running_loop(stopped_loop)
+        try:
+            helper.reconnect()
+        finally:
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is stopped_loop:
+                asyncio._set_running_loop(None)
+            stopped_loop.close()
+        self.assertEqual(helper.browser_process.pid, browser_pid)
+        self.assertEqual(helper.page.evaluate('window.manualOwnership'), 'completed')
+        self.assertEqual(len(helper.context.pages), 1)
+
+    def test_driver_stop_failure_prevents_starting_another_runtime(self):
+        helper = self.helper
+        original_runtime = helper.playwright
+        with patch.object(original_runtime, 'stop', side_effect=RuntimeError('synthetic stop failure')):
+            with patch('naver_browser.sync_playwright') as start:
+                with self.assertRaisesRegex(NaverSessionError, 'synthetic stop failure'):
+                    helper.reconnect()
+                start.assert_not_called()
+        self.assertIs(helper.playwright, original_runtime)
+        self.assertIsNone(helper.browser_process.poll())
+        self.assertEqual(helper.page.locator('#state').inner_text(), 'ownership-completed')
+        with patch.object(original_runtime, 'stop'):
+            with patch('naver_browser.sync_playwright') as start:
+                with self.assertRaisesRegex(NaverSessionError, 'still running'):
+                    helper.reconnect()
+                start.assert_not_called()
+        self.assertIs(helper.playwright, original_runtime)
+        self.assertEqual(helper.page.locator('#state').inner_text(), 'ownership-completed')
+
+    def test_stale_loop_cleanup_does_not_clear_foreign_or_running_loop(self):
+        helper = self.helper
+        original_loop = asyncio.get_running_loop()
+        foreign_loop = asyncio.new_event_loop()
+        self.addCleanup(foreign_loop.close)
+        asyncio._set_running_loop(foreign_loop)
+        try:
+            helper._clear_stale_driver_loop(helper.playwright._impl_obj._loop)
+            self.assertIs(asyncio.get_running_loop(), foreign_loop)
+            with patch.object(helper.playwright, 'stop', wraps=helper.playwright.stop) as stop:
+                with self.assertRaises(NaverSessionError):
+                    helper.reconnect()
+                stop.assert_not_called()
+            self.assertIs(asyncio.get_running_loop(), foreign_loop)
+        finally:
+            asyncio._set_running_loop(original_loop)
+        loop = helper.playwright._impl_obj._loop
+        with patch('naver_browser.asyncio.get_running_loop', return_value=loop):
+            with patch.object(loop, 'is_running', return_value=True):
+                with patch('naver_browser.asyncio._set_running_loop') as clear:
+                    helper._clear_stale_driver_loop(loop)
+                    clear.assert_not_called()
+
+    def test_reconnect_on_wrong_thread_does_not_stop_driver(self):
+        helper = self.helper
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with patch.object(helper.playwright, 'stop', wraps=helper.playwright.stop) as stop:
+                with self.assertRaises(NaverSessionError):
+                    worker.submit(helper.reconnect).result(timeout=10)
+                stop.assert_not_called()
+        self.assertEqual(helper.page.locator('#state').inner_text(), 'ownership-completed')
 
     def test_connection_error_diagnostic_redacts_authentication_values(self):
         error = RuntimeError('failed https://searchadvisor.naver.com/auth/callback?code=secret-one&state=secret-two token=secret-three cookie=secret-four')

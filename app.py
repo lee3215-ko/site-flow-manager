@@ -789,9 +789,9 @@ class PublisherApp(tk.Tk):
             try:
                 self._status('종료가 확인된 네이버 브라우저를 다시 준비합니다. 저장된 로그인 상태는 유지합니다.')
                 existing._close_browser(save_state=False)
-                existing.playwright.stop()
             except Exception:
                 pass
+            existing._stop_playwright()
             self.naver_browser = None
         browser = NaverBrowser(NAVER_PROFILE_DIR, self._status)
         browser.cancel_event = self.cancel_event

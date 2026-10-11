@@ -59,6 +59,18 @@ class BrowserRecoveryTests(unittest.TestCase):
         self.assertIs(PublisherApp._get_naver_browser(app), browser)
         browser._close_browser.assert_not_called()
 
+    def test_exited_browser_cleanup_failure_does_not_start_duplicate_runtime(self):
+        app = Mock()
+        old = app.naver_browser
+        old.connection_is_alive.return_value = False
+        old.browser_process.poll.return_value = 0
+        old._stop_playwright.side_effect = NaverSessionError('cleanup failed')
+        with patch('app.NaverBrowser') as new:
+            with self.assertRaisesRegex(NaverSessionError, 'cleanup failed'):
+                PublisherApp._get_naver_browser(app)
+            new.assert_not_called()
+        self.assertIs(app.naver_browser, old)
+
     def test_empty_tabs_do_not_close_connected_browser(self):
         app = Mock()
         old = app.naver_browser
